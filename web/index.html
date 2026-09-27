@@ -1,0 +1,366 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>PhoenixCoin Quantum Explorer</title>
+<style>
+  :root { color-scheme: light dark; }
+  body { font-family: system-ui, sans-serif; margin: 0; background: #f5f5f5; }
+  header { background: #222; color: #fff; padding: 12px 20px;
+           display: flex; align-items: center; gap: 12px; }
+  header h1 { font-size: 18px; margin: 0; }
+  header input[type=text] { flex: 1; max-width: 520px; padding: 7px 10px;
+           border-radius: 4px; border: none; font: inherit; }
+  header span#tip { font-size: 13px; color: #9fd; }
+  main { max-width: 980px; margin: 20px auto; padding: 0 16px; }
+  table { border-collapse: collapse; width: 100%; background: #fff; }
+  th, td { text-align: left; padding: 7px 10px; border-bottom: 1px solid #eee;
+           font-size: 13px; word-break: break-all; }
+  th { background: #eee; }
+  a { color: #06c; text-decoration: none; }
+  .mono { font-family: ui-monospace, monospace; font-size: 12px; }
+  .card { background: #fff; border-radius: 6px; padding: 16px; margin-bottom: 16px; }
+  .hl0 { color: #c00; }   /* spent */
+  .hl1 { color: #080; }   /* received */
+  h2 { font-size: 16px; margin-top: 0; }
+  .badge { background:#26a; color:#fff; padding:1px 7px; border-radius:10px;
+           font-size:11px; }
+  .badge.hybrid { background:#286; }
+  .badge.spent { background:#c00; }
+  footer { text-align: center; color: #888; font-size: 12px; padding: 24px; }
+</style>
+</head>
+<body>
+<header>
+  <h1><a href="#" data-home style="color:inherit;text-decoration:none">PhoenixCoin Quantum</a></h1>
+  <input id="q" type="text" placeholder="block height or hash, txid, or address..."
+         autocomplete="off">
+  <span id="tip"></span>
+</header>
+<main id="main"><div class="card">loading…</div></main>
+<footer>explorer backend: Python + SQLite (hybrid-aware via daemon RPC)</footer>
+
+<script>
+const main = document.getElementById("main");
+const tip = document.getElementById("tip");
+const q = document.getElementById("q");
+
+function render(o) {
+  // Dispatch on the payload's shape, not on o.tip being non-null: a fresh
+  // database returns {"tip": null}, which is a valid summary of an empty chain
+  // and must not fall through to "Nothing found.".
+  if (o && "tip" in o) {
+    if (o.tip) tip.textContent = "height " + o.tip.height;
+    else tip.textContent = "no blocks indexed";
+    return summary(o);
+  }
+  if (o && o.script_hash) return script(o);
+  if (o && o.address && o.confirmed) return address(o);
+  if (o && o.hash && o.txs) return block(o);
+  if (o && o.vin)  return tx(o);
+  main.innerHTML = '<div class="card"><b>Nothing found.</b></div>';
+}
+
+function summary(o) {
+  // tip === null means the database is empty: no blocks indexed yet. Counts
+  // are absent from the payload in that case too, so don't render the table.
+  if (!o.tip) {
+    main.innerHTML = `
+    <div class="card">
+      <h2>No blocks indexed</h2>
+      <p>This chain database is empty. Start the indexer to populate it, then
+         reload — <code>indexer.py</code> syncs from the daemon's tip.</p>
+    </div>`;
+    return;
+  }
+  main.innerHTML = `
+  <div class="card">
+    <h2>Tip <span class="badge">height ${esc(o.tip.height)}</span></h2>
+    <div class="mono">${esc(o.tip.hash)}</div>
+    <p>${o.tip.time ? new Date(o.tip.time*1000).toISOString() : ""}</p>
+    <table>
+      <tr><th>block</th><th>txs</th><th>mempool</th><th>difficulty</th><th>total coinbase</th></tr>
+      <tr><td><a href="#" data-b="tip">#${esc(o.tip.height)}</a></td>
+          <td>${esc(o.n_txs)}</td>
+          <td><a href="#" data-t="mempool">${esc(o.n_mempool)}</a></td>
+          <td>${esc(o.tip.difficulty)}</td>
+          <td><b>${esc(o.total_coinbase_pxc)} PXC</b></td></tr>
+    </table>
+  </div>`;
+  main.querySelector("a[data-t]").onclick = e => {
+    e.preventDefault();
+    go("mempool");
+  };
+  main.querySelectorAll("a[data-b=tip]").forEach(a =>
+    a.onclick = e => { e.preventDefault(); go(String(o.tip.height)); });
+  fetch("/api/recent_blocks").then(r => r.json()).then(renderRecentBlocks);
+}
+
+function renderRecentBlocks(blocks) {
+  const rows = blocks.map(b => `
+    <tr><td><a href="#" data-h="${esc(b.height)}">${esc(b.height)}</a></td>
+        <td>${esc(b.n_txs)}</td>
+        <td class="mono">${esc(b.hash)}</td>
+        <td>${b.time ? new Date(b.time*1000).toISOString() : ""}</td></tr>`).join("");
+  main.insertAdjacentHTML("beforeend", `
+  <div class="card"><h2>Latest Blocks</h2>
+    <table><tr><th>height</th><th>txs</th><th>hash</th><th>time</th></tr>
+      ${rows}</table>
+  </div>`);
+  main.querySelectorAll("a[data-h]").forEach(a =>
+    a.onclick = e => { e.preventDefault(); go(a.dataset.h); });
+}
+
+function mempool(txs) {
+  main.innerHTML = `<div class="card"><h2>Mempool (${esc(txs.length)})</h2>
+    ${txs.map(t => `<div class="mono"><a href="#" data-tx="${esc(t)}">${esc(t)}</a></div>`).join("")}
+  </div>`;
+  main.querySelectorAll("a[data-tx]").forEach(a =>
+    a.onclick = e => { e.preventDefault(); go(a.dataset.tx); });
+}
+
+async function fetchMempool() {
+  main.innerHTML = '<div class="card">looking up…</div>';
+  const txs = await fetch("/api/mempool").then(r => r.json());
+  mempool(txs);
+}
+
+function go(param) {
+  q.value = param;
+  const target = "#" + encodeURIComponent(param);
+  if (location.hash === target) {
+    fetchHint(param);
+  } else {
+    location.hash = target;
+  }
+}
+
+async function fetchHint(param) {
+  if (param === "mempool") return fetchMempool();
+  main.innerHTML = '<div class="card">looking up…</div>';
+  if (/^\d+$/.test(param)) {
+    const r = await fetch("/api/block/" + param);
+    if (r.ok) { render(await r.json()); return; }
+  }
+  if (/^[0-9a-f]{40}$/i.test(param)) {
+    const rs = await fetch("/api/script/" + param);
+    if (rs.ok) { render(await rs.json()); return; }
+  }
+  const r = await fetch("/api/block/" + param);
+  if (r.ok) { render(await r.json()); return; }
+  const r2 = await fetch("/api/tx/" + param);
+  if (r2.ok) { render(await r2.json()); return; }
+  const r3 = await fetch("/api/address/" + param);
+  if (r3.ok) { render(await r3.json()); return; }
+  main.innerHTML = '<div class="card"><b>Nothing found.</b></div>';
+}
+
+function fmtSize(s) {
+  if (s === null || s === undefined) return "—";
+  return s + " B";
+}
+
+function block(b) {
+  const rows = b.txs.map(t => `
+    <tr><td>${esc(t.index)}</td>
+        <td><a href="#" data-tx="${esc(t.txid)}" class="mono">${esc(t.txid)}</a></td>
+        <td>${t.coinbase ? '<span class="badge">coinbase</span>' : ""}</td></tr>`).join("");
+  main.innerHTML = `
+  <div class="card">
+    <h2>Block <span class="badge">${esc(b.height)}</span></h2>
+    <div class="mono">${esc(b.hash)}</div>
+    <table>
+      <tr><th>time</th><td>${new Date(b.time*1000).toISOString()}</td></tr>
+      <tr><th>txs</th><td>${esc(b.txs.length)}</td></tr>
+      <tr><th>size</th><td>${fmtSize(b.size)}</td></tr>
+      <tr><th>difficulty</th><td>${esc(b.difficulty)}</td></tr>
+      <tr><th>total coinbase</th><td><b>${esc(b.total_coinbase_pxc)} PXC</b></td></tr>
+      <tr><th>nonce</th><td>${esc(b.nonce)}</td></tr>
+      <tr><th>bits</th><td>${esc(b.bits)}</td></tr>
+      <tr><th>merkleroot</th><td class="mono">${esc(b.merkleroot)}</td></tr>
+      <tr><th>prev</th><td class="mono"><a href="#" data-b="prev">${esc(b.prev_hash || "—")}</a></td></tr>
+      <tr><th>next</th><td class="mono"><a href="#" data-b="next">${esc(b.next_hash || "—")}</a></td></tr>
+    </table>
+  </div>
+  <div class="card"><h2>Transactions</h2>
+    <table><tr><th>#</th><th>txid</th><th></th></tr>${rows}</table>
+  </div>`;
+  main.querySelectorAll("a[data-tx]").forEach(a =>
+    a.onclick = e => { e.preventDefault(); go(a.dataset.tx); });
+  const pb = main.querySelector("a[data-b=prev]");
+  if (pb) pb.onclick = e => { e.preventDefault(); go(pb.textContent); };
+  const nb = main.querySelector("a[data-b=next]");
+  if (nb) nb.onclick = e => { e.preventDefault(); go(nb.textContent); };
+}
+
+function esc(s) {
+  return String(s ?? "")
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;")
+    .replaceAll('"', "&quot;")
+    .replaceAll("'", "&#39;");
+}
+
+function addrLink(a) {
+  a = esc(a);
+  return `<a href="#" data-a="${a}">${a}</a>`;
+}
+
+function plural(n, word) {
+  return `${esc(n)} ${word}${n === 1 ? "" : "s"}`;
+}
+
+function heightLink(h) {
+  // Null height: this script has only ever been seen unconfirmed, so there is
+  // no block to link to (a sentinel height like 2147483648 would be a lie).
+  if (h === null || h === undefined) return "mempool";
+  return `#<a href="#" data-b="h">${esc(h)}</a>`;
+}
+
+function tx(t) {
+  const ins = t.vin.map(v =>
+    v.coinbase ? `<tr><td>coinbase: <span class="mono">${esc(v.coinbase)}</span></td></tr>`
+    : `<tr><td class="mono"><a href="#" data-tx="${esc(v.prev_txid)}">${esc(v.prev_txid)}</a>:${esc(v.prev_vout)}</td></tr>`).join("");
+  const outs = t.vout.map(v => `
+    <tr><td>${esc(v.value_hex)}</td>
+        <td><span class="badge ${v.type.includes("hybrid") ? "hybrid" : ""}">${esc(v.type)}</span></td>
+        <td>${(v.addresses || []).map(addrLink).join(", ") || "—"}</td>
+        <td class="mono">${v.script_hash ? `<span class="badge">script</span> <a href="#" data-sh="${esc(v.script_hash)}" class="scripthash">${esc(v.script_hash.slice(0, 16))}…</a><br>` : ""}${esc((v.script_hex || "").slice(0, 120))}…</td>
+    </tr>`).join("");
+  const kind = t.is_coinbase ? '<span class="badge">coinbase</span>'
+             : (t.status === "mempool" ? '<span class="badge">mempool</span>'
+             : (t.status === "orphaned" ? '<span class="badge" style="background:#c60">orphaned</span>'
+             : ""));
+  let blockrow = t.height !== null
+      ? `<tr><th>block</th><td><a href="#" data-b="h">${esc(t.height)}</a></td></tr>` : "";
+  main.innerHTML = `
+  <div class="card">
+    <h2>Transaction ${kind}</h2>
+    <div class="mono">${esc(t.txid)}</div>
+    <table>
+      <tr><th>version</th><td>${esc(t.version)}</td></tr>
+      <tr><th>locktime</th><td>${esc(t.locktime)}</td></tr>
+      <tr><th>size</th><td>${fmtSize(t.size)}</td></tr>
+      ${blockrow}
+    </table>
+  </div>
+  <div class="card"><h2>Inputs</h2>
+    <table>${ins}</table>
+  </div>
+  <div class="card"><h2>Outputs</h2>
+    <table><tr><th>value</th><th>type</th><th>address</th><th>script</th></tr>
+      ${outs}</table>
+  </div>`;
+  main.querySelectorAll("a[data-tx]").forEach(a =>
+    a.onclick = e => { e.preventDefault(); go(a.dataset.tx); });
+  main.querySelectorAll("a[data-a]").forEach(a =>
+    a.onclick = e => { e.preventDefault(); go(a.dataset.a); });
+  main.querySelectorAll("a[data-sh]").forEach(a =>
+    a.onclick = e => { e.preventDefault(); go(a.dataset.sh); });
+  const bb = main.querySelector("a[data-b=h]");
+  if (bb) bb.onclick = e => { e.preventDefault(); go(bb.textContent); };
+}
+
+function address(a) {
+  const rows = a.outputs.map(o => `
+    <tr><td><a href="#" data-tx="${esc(o.txid)}">${esc(o.txid)}</a></td>
+        <td>${esc(o.n)}</td>
+        <td>${esc(o.value_hex)}</td>
+        <td><span class="badge ${o.type.includes("hybrid") ? "hybrid" : ""}">${esc(o.type)}</span></td>
+        <td>${o.spent
+              ? (o.spent_confirmed
+                  ? '<span class="badge spent">spent</span>'
+                  : '<span class="badge" style="background:#a60">spent (mempool)</span>')
+              : '<span class="badge" style="background:#080">unspent</span>'}</td>
+    </tr>`).join("");
+  const trows = a.txs.map(t =>
+    `<tr><td class="mono"><a href="#" data-tx="${esc(t)}">${esc(t)}</a></td></tr>`).join("");
+  const notice = a.outputs_truncated
+    ? `<p class="card" style="padding:10px 16px;color:#c60;font-size:12px">Showing the first
+       ${esc(a.outputs.length)} of ${esc(a.n_outputs)} outputs (balances are still accurate).</p>` : "";
+  main.innerHTML = `
+  <div class="card">
+    <h2>Address</h2>
+    <div class="mono">${esc(a.address)}</div>
+    <table>
+      <tr><th>confirmed balance</th><td><b>${esc(a.confirmed.balance_hex)}</b> PXC</td></tr>
+      <tr><th>received</th><td>${esc(a.confirmed.value_received_hex)} PXC (${plural(a.confirmed.n_outputs, "output")})</td></tr>
+      <tr><th>spent</th><td>${esc(a.confirmed.value_spent_hex)} PXC</td></tr>
+      <tr><th>live balance <span class="badge">incl. mempool</span></th>
+          <td><b>${esc(a.live.balance_hex)}</b> PXC</td></tr>
+      <tr><th>received</th><td>${esc(a.live.value_received_hex)} PXC (${plural(a.live.n_outputs, "output")})</td></tr>
+      <tr><th>spent</th><td>${esc(a.live.value_spent_hex)} PXC</td></tr>
+      <tr><th>txs</th><td>${esc(a.txs.length)}</td></tr>
+    </table>
+  </div>
+  ${notice}
+  <div class="card"><h2>Outputs</h2>
+    <table><tr><th>txid</th><th>vout</th><th>value</th><th>type</th><th>status</th></tr>
+      ${rows}</table>
+  </div>
+  <div class="card"><h2>Transactions</h2>
+    <table>${trows}</table>
+  </div>`;
+  main.querySelectorAll("a[data-tx]").forEach(a =>
+    a.onclick = e => { e.preventDefault(); go(a.dataset.tx); });
+}
+
+function script(s) {
+  const owners = (s.addresses || []).map(addrLink).join(", ") || "—";
+  const bal = (b, label) => `
+      <tr><th>${label}</th><td><b>${esc(b.balance_hex)}</b> PXC</td></tr>
+      <tr><th>received</th><td>${esc(b.value_received_hex)} PXC (${plural(b.n_vout, "output")})</td></tr>
+      <tr><th>spent</th><td>${esc(b.value_spent_hex)} PXC (${plural(b.n_spent, "output")})</td></tr>`;
+  const differs = s.confirmed.balance !== s.live.balance;
+  const delta = ((s.live.balance - s.confirmed.balance) / 1e8).toFixed(8);
+  const sign = s.live.balance > s.confirmed.balance ? "+" : "";
+  main.innerHTML = `
+  <div class="card">
+    <h2>Script <span class="badge">${esc(s.type)}</span></h2>
+    <div class="mono">${esc(s.script_hash)}</div>
+    <table>
+      <tr><th>owners (participants)</th><td>${owners}</td></tr>
+      <tr><th>required sigs</th><td>${esc(s.req_sigs)}</td></tr>
+      ${bal(s.confirmed, "confirmed balance")}
+      ${bal(s.live, "live balance <span class=\"badge\">incl. mempool</span>")}
+      <tr><th>first seen</th><td>${heightLink(s.created_height)}</td></tr>
+      <tr><th>last seen</th><td>${heightLink(s.last_height)}</td></tr>
+    </table>
+    ${differs ? `<p style="color:#c60;font-size:12px;margin:8px 16px">
+      Unconfirmed transactions move the balance by ${sign}${esc(delta)} PXC.
+      A mempool spend can still be replaced, so the confirmed figure is the
+      one that cannot be taken away.</p>` : ""}
+  </div>`;
+  main.querySelectorAll("a[data-a]").forEach(a =>
+    a.onclick = e => { e.preventDefault(); go(a.dataset.a); });
+  main.querySelectorAll("a[data-b=h]").forEach(a =>
+    a.onclick = e => { e.preventDefault(); go(a.textContent); });
+}
+
+q.addEventListener("keydown", e => { if (e.key === "Enter" && q.value) go(q.value); });
+document.querySelector("a[data-home]").onclick = e => {
+  e.preventDefault();
+  q.value = "";
+  if (location.hash) {
+    history.pushState("", "", location.pathname);
+  }
+  route();
+};
+
+function route() {
+  const h = location.hash.slice(1);
+  if (!h) {
+    fetch("/api/summary").then(r => r.json()).then(render);
+  } else {
+    try { go(decodeURIComponent(h)); }
+    catch { go(h); }
+  }
+}
+
+window.addEventListener("hashchange", route);
+route();
+</script>
+</body>
+</html>
