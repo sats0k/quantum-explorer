@@ -22,10 +22,54 @@ import db as db_module
 import server as server_module
 from decimal import Decimal
 from db import DB, script_hash_of
-from indexer import Indexer, In, Out, Tx, amount_to_pokes, tx_from_verbose
+from indexer import (Block, Indexer, In, Out, Tx, amount_to_pokes,
+                     tx_from_verbose)
+from rpc import RPCError
 from server import DBPool, Explorer, poke
 
 POKE = 100_000_000
+
+
+class FakeDaemon:
+    """The RPC surface sync_blocks() uses, over a chain of `tip` blocks.
+
+    A block hashes as "b<height>", so `hashes` can be used to make the daemon's
+    chain differ from the indexed one at a height both agree on. getblockhash
+    past the tip raises, the way a real daemon answers a height it does not have.
+    """
+
+    def __init__(self, tip, hashes=None):
+        self.tip = tip
+        self.hashes = hashes or {}
+
+    def hash_at(self, height):
+        return self.hashes.get(height, "b%04d" % height)
+
+    def getblockcount(self):
+        return self.tip
+
+    def getblockhash(self, height):
+        height = int(height)
+        if not 0 <= height <= self.tip:
+            raise RPCError("Block height out of range")
+        return self.hash_at(height)
+
+    def getblock(self, blockhash):
+        height = int(blockhash[1:])
+        return {"height": height, "hash": self.hash_at(height), "tx": [],
+                "previousblockhash":
+                    self.hash_at(height - 1) if height else None}
+
+    def batch(self, calls, strict=True):
+        out = []
+        for method, params in calls:
+            try:
+                out.append(getattr(self, method)(*params))
+            except RPCError:
+                if strict:
+                    raise
+                out.append(None)
+        return out
 
 
 def script_hex(tag):
@@ -864,6 +908,90 @@ class AddOrderSpentFlagTest(DBTestCase):
         self.assertEqual(self.is_spent("P"), True)
         self.db.add_tx(tx("C", None, [("addr1", POKE, 2)]))   # same txid, no input
         self.assertEqual(self.is_spent("P"), False, "C no longer spends P:0")
+
+
+class ShorterChainTest(DBTestCase):
+    """The index must give blocks back when the daemon no longer has them.
+
+    A daemon that rolls back, or comes back from an older backup, reports a
+    lower tip than we hold. That used to be unreachable: sync_blocks() verified
+    the tip by asking for getblockhash(synced), a height the daemon does not
+    have, and the resulting error was retried forever without ever reaching the
+    code that truncates.
+    """
+
+    def index_to(self, daemon, height):
+        """Index blocks 0..height as the daemon describes them."""
+        with self.db.bulk():
+            for h in range(height + 1):
+                self.db.add_block(Block(daemon.getblock(daemon.hash_at(h))))
+        return self.db.tip_height()
+
+    def test_a_daemon_behind_us_is_truncated_not_retried(self):
+        daemon = FakeDaemon(990)
+        self.assertEqual(self.index_to(daemon, 1000), 1000)
+        self.indexer.rpc = daemon
+        self.indexer.sync_blocks()            # must not raise
+        self.assertEqual(self.db.tip_height(), 990)
+        self.assertEqual(self.db.query("SELECT COUNT(*) FROM blocks")[0][0], 991)
+
+    def test_the_tip_block_that_survives_is_the_one_the_daemon_has(self):
+        # Truncating to the daemon's tip is only half of it: the block left at
+        # that height has to be the daemon's, or the tip check would still see a
+        # mismatch and truncate again on every cycle.
+        daemon = FakeDaemon(990, hashes={990: "x0990"})
+        self.index_to(daemon, 1000)
+        self.indexer.rpc = daemon
+        self.indexer.sync_blocks()
+        self.assertEqual(self.db.tip_height(), 990)
+        self.assertEqual(
+            self.db.query("SELECT hash FROM blocks WHERE height=990")[0][0],
+            "x0990")
+        before = self.db.tip_hash()
+        self.indexer.sync_blocks()            # idempotent: nothing left to do
+        self.assertEqual(self.db.tip_hash(), before)
+
+    def test_txs_above_the_new_tip_are_orphaned_not_deleted(self):
+        daemon = FakeDaemon(990)
+        self.index_to(daemon, 1000)
+        self.db.add_tx(tx("X", 995, [("addr0", POKE, 1)], coinbase=True))
+        self.db.add_tx(tx("Y", 900, [("addr1", POKE, 2)], coinbase=True))
+        self.indexer.rpc = daemon
+        self.indexer.sync_blocks()
+        self.assertEqual(self.db.query(
+            "SELECT status FROM txs WHERE txid='X'")[0][0], "orphaned")
+        self.assertEqual(self.rows_for("vout", "X"), 0)
+        self.assertEqual(self.db.query(
+            "SELECT status FROM txs WHERE txid='Y'")[0][0], "confirmed")
+        self.assertEqual(self.is_spent("Y", 0), False)
+
+    def test_a_daemon_with_no_chain_yet_does_not_truncate(self):
+        # getblockcount below zero means the daemon is not serving a chain. It
+        # is not evidence that our blocks are wrong, and truncating on it would
+        # cost a full reindex.
+        self.index_to(FakeDaemon(1000), 1000)
+        self.indexer.rpc = FakeDaemon(-1)
+        self.indexer.sync_blocks()
+        self.assertEqual(self.db.tip_height(), 1000)
+
+    def test_a_daemon_ahead_of_us_is_caught_up_not_truncated(self):
+        daemon = FakeDaemon(1005)
+        self.assertEqual(self.index_to(daemon, 1000), 1000)
+        self.indexer.rpc = daemon
+        self.indexer.sync_blocks()
+        self.assertEqual(self.db.tip_height(), 1005)
+        self.assertEqual(self.db.query("SELECT COUNT(*) FROM blocks")[0][0], 1006)
+
+    def test_a_tip_that_moved_on_while_the_daemon_lost_blocks(self):
+        # Truncate, then catch up: the blocks between the two tips are indexed
+        # in one pass, and the tip check agrees on the last of them.
+        daemon = FakeDaemon(1003)
+        self.index_to(daemon, 1000)
+        self.indexer.rpc = daemon
+        self.indexer.sync_blocks()
+        self.assertEqual(self.db.tip_height(), 1003)
+        self.indexer.sync_blocks()
+        self.assertEqual(self.db.tip_height(), 1003)
 
 
 class TotalCoinbaseCacheTest(DBTestCase):

@@ -175,6 +175,20 @@ class Indexer:
                 return
             tip = int(self.rpc.getblockcount())
             synced = self.db.tip_height()
+            if synced > tip:
+                # We hold blocks the daemon does not, which no reorg of a longer
+                # chain explains: it rolled back, or was restored from an older
+                # backup. Hand them back before anything else, because the tip
+                # check below asks for getblockhash(synced) -- a height the
+                # daemon does not have -- and that error is retried forever
+                # without ever reaching the code that truncates.
+                if tip < 0:
+                    # No chain to compare against yet. Truncating here would
+                    # throw away a good index over a reading about to change.
+                    return
+                print("daemon tip %d is behind our %d, truncating" % (tip, synced))
+                self.db.clear_from(tip + 1)
+                synced = tip
             if synced >= tip:
                 # We're at (or beyond) the tip — verify the tip hash matches,
                 # otherwise the chain reorganized underneath us.
