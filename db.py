@@ -475,8 +475,9 @@ class DB:
         good, rather than being replaced by a re-index. Callers should never
         have to DELETE from txs/vin/vout/addr_out themselves: addr_out.is_spent
         is maintained here, so a raw delete leaves an output looking spent when
-        no spender is left. Script balances need no retraction -- they are
-        derived from vout/vin on read.
+        no spender is left. Script *balances* need no retraction -- they are
+        derived from vout/vin on read -- but the scripts row is metadata, so it
+        is rebuilt here.
         """
         self.remove_txs([txid])
 
@@ -488,7 +489,8 @@ class DB:
         That makes the result independent of the order the txs are removed in:
         an output spent by two of them, or by one whose own output is also
         being removed, is re-evaluated against the final set of spending
-        inputs instead of a half-emptied table.
+        inputs instead of a half-emptied table. The scripts metadata is
+        rebuilt from what survives, for the same order-independence.
         """
         txids = list(txids)
         if not txids:
@@ -506,6 +508,16 @@ class DB:
             "SELECT DISTINCT prev_txid, prev_vout FROM vin "
             "WHERE txid IN (%s) AND prev_txid IS NOT NULL"
             % ",".join("?" * len(txids)), txids).fetchall()
+        # ...and the scripts these txs' outputs were evidence of, for the same
+        # reason: vout is what rebuild_scripts() aggregates, and it is about to
+        # be empty. Without this a script seen only in the mempool keeps its
+        # row forever, and /api/script/<hash> answers 200 for a script that no
+        # longer exists in the chain or the mempool -- zero balances, but real
+        # type/addresses/height metadata.
+        touched = [r[0] for r in self.conn.execute(
+            "SELECT DISTINCT script_hash FROM vout "
+            "WHERE txid IN (%s) AND script_hash IS NOT NULL"
+            % ",".join("?" * len(txids)), txids)]
         for txid in txids:
             self.conn.execute("DELETE FROM txs WHERE txid=?", (txid,))
             self.conn.execute("DELETE FROM vin WHERE txid=?", (txid,))
@@ -521,6 +533,12 @@ class DB:
                      WHERE vin.prev_txid=? AND vin.prev_vout=?)
                    WHERE txid=? AND n=?""",
                 (ptid, pn, ptid, pn))
+        # Recompute rather than delete: a script with a surviving output
+        # elsewhere keeps its row, and the rebuild both restores its metadata
+        # and drops the ones nothing is left for. Scoped for the same reason
+        # clear_from scopes its own -- one mempool eviction must not re-aggregate
+        # every output in the index.
+        self.rebuild_scripts(touched)
 
     def query(self, sql, params=()):
         return self.conn.execute(sql, params).fetchall()

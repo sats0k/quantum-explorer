@@ -637,6 +637,53 @@ class ScriptsRebuildTest(DBTestCase):
         # the five untouched scripts kept their rows untouched
         self.assertEqual(len(self.scripts_table()), 5)
 
+    def test_mempool_only_script_disappears_after_eviction(self):
+        # A script is described entirely by its vout rows, so when the last one
+        # is evicted the row has nothing left to describe. Kept anyway, it makes
+        # /api/script/<hash> answer 200 with a real type and address list over
+        # zero balances -- a script that exists nowhere in the index.
+        h = script_hash_of(script_hex(1))
+        self.db.add_tx(tx("A", None, [("addr0", POKE, 1)], coinbase=True))
+        self.assertIn(h, self.scripts_table())
+        self.indexer.close_stale_mempool([])
+        self.assertNotIn(h, self.scripts_table())
+        self.assertIsNone(self.explorer.script(h), "404, not a zero-balance ghost")
+        self.assertEqual(self.scripts_table(), {})
+
+    def test_an_eviction_keeps_a_script_that_still_has_an_output(self):
+        self.add_chain(1)                                    # confirmed at 100
+        self.db.add_tx(tx("A1", None, [("addr9", POKE, 1)]))  # mempool, same script
+        h = script_hash_of(script_hex(1))
+        self.indexer.close_stale_mempool([])
+        scoped = self.scripts_table()
+        self.assertIn(h, scoped, "one output is still there, so is the script")
+        self.assertEqual(scoped[h][-2:], (100, 100), "a mempool tx adds no height")
+        self.assertEqual(self.explorer.script(h)["live"]["balance"], POKE)
+        self.db.rebuild_scripts()
+        self.assertEqual(scoped, self.scripts_table())
+
+    def test_an_eviction_rebuilds_only_the_scripts_it_removed(self):
+        # The point of scoping: a mempool eviction must not re-aggregate the
+        # whole table, for the same reason a reorg does not.
+        self.add_chain(6)
+        self.db.add_tx(tx("M0", None, [("addr9", POKE, 1)]))  # reuses script 0
+        self.db.add_tx(tx("M5", None, [("addr9", POKE, 6)]))  # reuses script 5
+        got = []
+        real = DB.rebuild_scripts
+
+        def spy(db, script_hashes=None):
+            got.append(None if script_hashes is None else list(script_hashes))
+            return real(db, script_hashes)
+
+        with mock.patch.object(DB, "rebuild_scripts", spy):
+            self.db.remove_txs(["M0", "M5"])
+        self.assertEqual(len(got), 1)
+        self.assertIsNotNone(got[0], "an eviction must not trigger a full rebuild")
+        self.assertEqual(sorted(got[0]),
+                         sorted(script_hash_of(script_hex(t)) for t in (1, 6)))
+        # the other four scripts kept their rows untouched
+        self.assertEqual(len(self.scripts_table()), 6)
+
 
 class ReorgSpentFlagTest(DBTestCase):
     """Retracting only the freed outputs must equal a full recompute."""
