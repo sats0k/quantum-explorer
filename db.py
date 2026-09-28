@@ -305,16 +305,15 @@ class DB:
         else:
             self._clear_from(height)
 
-    def _retract_spent_flags(self, freed):
-        """Recompute is_spent for the given (txid, n) outputs only.
+    def _refresh_spent_flags(self, outputs):
+        """Recompute addr_out.is_spent for the given (txid, n) outputs.
 
-        `freed` are the outputs whose spending inputs have just gone away, so
-        each may have no spender left -- but the surviving vin rows are the
-        authority, not the assumption. EXISTS keeps a conflict right: an output
-        two removed txs both spent, or one removed tx and one mempool tx spent,
-        still has a spender and stays spent.
+        The surviving vin rows are the authority, so a conflict stays right: an
+        output two known txs both spend still counts as spent after either one
+        is re-indexed or removed. Every writer goes through here, which is what
+        makes the flag independent of the order txs were added in.
         """
-        for txid, n in freed:
+        for txid, n in outputs:
             self.conn.execute(
                 """UPDATE addr_out SET is_spent = EXISTS (
                      SELECT 1 FROM vin
@@ -356,7 +355,7 @@ class DB:
         # then set from vin) rewrote one row per address output on the whole
         # chain and scanned all of vin to do it, for a reorg that usually
         # touches a few dozen outputs.
-        self._retract_spent_flags(freed)
+        self._refresh_spent_flags(freed)
         # Rebuild the scripts the severed txs touched, not the whole table.
         self.rebuild_scripts(touched)
         # Bound tombstone growth: drop orphans older than the retention window.
@@ -394,6 +393,16 @@ class DB:
             self._add_tx(t)
 
     def _add_tx(self, t):
+        # Prevouts a previous version of this tx held, read before its vin rows
+        # go away. A re-index spends the same set (a txid pins its content), so
+        # this is normally empty -- but a changed set must not leave the old
+        # ones marked spent.
+        held = {(ipt.prev_txid, ipt.prev_vout) for ipt in t.vin
+                if ipt.coinbase is None and ipt.prev_txid}
+        released = [r for r in self.conn.execute(
+            "SELECT DISTINCT prev_txid, prev_vout FROM vin "
+            "WHERE txid=? AND prev_txid IS NOT NULL", (t.txid,))
+            if r not in held]
         self.conn.execute("DELETE FROM txs WHERE txid=?", (t.txid,))
         self.conn.execute("DELETE FROM vin WHERE txid=?", (t.txid,))
         self.conn.execute("DELETE FROM vout WHERE txid=?", (t.txid,))
@@ -467,6 +476,14 @@ class DB:
                        """,
                     (sh, ot.type, ot.req_sigs,
                      json.dumps(ot.addresses), t.height, t.height))
+        # is_spent is a fact about vin, not something the INSERT above gets to
+        # decide. The input loop can only mark a prevout spent if the output is
+        # already in addr_out, which misses a child indexed before its parent,
+        # and a re-index misses it too: the rows are deleted and rebuilt over
+        # the column default. One extra indexed seek per output, in the noise of
+        # the add itself.
+        self._refresh_spent_flags(
+            [(t.txid, n) for n, _ in enumerate(t.vout)] + released)
 
     def remove_tx(self, txid):
         """Drop a tx and every row derived from it (stale mempool eviction).
@@ -526,13 +543,7 @@ class DB:
         # An output any of them spent may have no spender left. EXISTS runs
         # against the post-delete table, so it also covers the case where the
         # last spender was itself in this batch.
-        for ptid, pn in spent_prev:
-            self.conn.execute(
-                """UPDATE addr_out SET is_spent = EXISTS (
-                     SELECT 1 FROM vin
-                     WHERE vin.prev_txid=? AND vin.prev_vout=?)
-                   WHERE txid=? AND n=?""",
-                (ptid, pn, ptid, pn))
+        self._refresh_spent_flags(spent_prev)
         # Recompute rather than delete: a script with a surviving output
         # elsewhere keeps its row, and the rebuild both restores its metadata
         # and drops the ones nothing is left for. Scoped for the same reason

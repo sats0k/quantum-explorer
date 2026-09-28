@@ -50,6 +50,15 @@ def tx(txid, height, pays, spends=(), coinbase=False, owners=None, req_sigs=1):
     return Tx(txid, height, 0, 1, 0, 100, coinbase, vin, vout)
 
 
+def full_spent_recompute(db):
+    """Ground truth for addr_out.is_spent, recomputed from vin for the whole
+    table. Any write path, whatever order it ran in, must agree with this."""
+    db.conn.execute("UPDATE addr_out SET is_spent=0")
+    db.conn.execute(
+        """UPDATE addr_out SET is_spent=1 WHERE (txid, n) IN
+           (SELECT prev_txid, prev_vout FROM vin WHERE prev_txid IS NOT NULL)""")
+
+
 class DBTestCase(unittest.TestCase):
     def setUp(self):
         self.dir = self._new_dir()
@@ -693,10 +702,7 @@ class ReorgSpentFlagTest(DBTestCase):
 
     def full_recompute(self):
         """The pre-existing whole-table version, for comparison."""
-        self.db.conn.execute("UPDATE addr_out SET is_spent=0")
-        self.db.conn.execute(
-            """UPDATE addr_out SET is_spent=1 WHERE (txid, n) IN
-               (SELECT prev_txid, prev_vout FROM vin WHERE prev_txid IS NOT NULL)""")
+        full_spent_recompute(self.db)
 
     def build_random_chain(self, n_txs=40, seed=0):
         """A random spend graph over confirmed txs, plus mempool spends."""
@@ -767,19 +773,97 @@ class ReorgSpentFlagTest(DBTestCase):
                           spends=[("T01", 0)]))
         # conn.execute is read-only on the C object, so spy on the DB method
         # that issues the retraction instead.
-        real_retract = DB._retract_spent_flags
+        real_retract = DB._refresh_spent_flags
         calls = []
 
         def spy_retract(db, freed):
             calls.append(list(freed))
             return real_retract(db, freed)
 
-        with mock.patch.object(DB, "_retract_spent_flags", spy_retract):
+        with mock.patch.object(DB, "_refresh_spent_flags", spy_retract):
             self.db.clear_from(150)
         self.assertEqual(len(calls), 1)
         self.assertEqual(sorted(calls[0]), [("T00", 0), ("T01", 0)])
         self.assertEqual(self.is_spent("T00", 0), False)
         self.assertEqual(self.is_spent("T01", 0), False)
+
+
+class AddOrderSpentFlagTest(DBTestCase):
+    """is_spent must follow the vin table, not the order txs were added in.
+
+    Nothing promises an order: getrawmempool hands txs back as it likes, and a
+    parent is re-indexed when it confirms while a child spending it may still be
+    unconfirmed. Every order has to end up what a whole-table recompute says.
+    """
+
+    def parent(self, height=None):
+        return tx("P", height, [("addr0", POKE, 1)], coinbase=True)
+
+    def child(self, txid="C", spends=("P", 0)):
+        return tx(txid, None, [("addr1", POKE, 2)], spends=[spends])
+
+    def test_parent_before_child(self):
+        self.db.add_tx(self.parent())
+        self.db.add_tx(self.child())
+        self.assertEqual(self.is_spent("P"), True)
+
+    def test_child_before_parent(self):
+        # The child's input UPDATE matched no row, because P:0 did not exist
+        # yet, and the parent's INSERT then wrote the column default over a
+        # spender that had been known all along.
+        self.db.add_tx(self.child())
+        self.db.add_tx(self.parent())
+        self.assertEqual(self.is_spent("P"), True, "C spends P:0")
+
+    def test_parent_confirmed_while_the_child_stays_mempool(self):
+        self.db.add_tx(self.parent())
+        self.db.add_tx(self.child())
+        self.db.add_tx(self.parent(300))       # mined: re-indexed as confirmed
+        self.assertEqual(self.is_spent("P"), True,
+                         "a re-index must not unspend an output C still spends")
+
+    def test_parent_confirmed_before_the_child_arrives(self):
+        self.db.add_tx(self.parent(300))
+        self.db.add_tx(self.child())
+        self.assertEqual(self.is_spent("P"), True)
+
+    def test_parent_reappears_after_its_own_eviction(self):
+        self.db.add_tx(self.parent())
+        self.db.add_tx(self.child())
+        self.indexer.close_stale_mempool(["C"])   # P evicted, C still spends it
+        self.assertIsNone(self.is_spent("P"), "P:0 went with P")
+        self.db.add_tx(self.parent())             # and comes back
+        self.assertEqual(self.is_spent("P"), True)
+
+    def test_two_conflicting_spenders_survive_any_reindex(self):
+        self.db.add_tx(self.parent(300))
+        self.db.add_tx(self.child("C1"))
+        self.db.add_tx(self.child("C2"))
+        for again in (self.parent(300), self.child("C1"), self.child("C2")):
+            self.db.add_tx(again)
+            self.assertEqual(self.is_spent("P"), True,
+                             "re-indexing %s forgot the other spender" % again.txid)
+
+    def test_the_flags_do_not_depend_on_the_order_txs_are_added(self):
+        txs = [self.parent(300), self.child("C1"), self.child("C2")]
+        for order in itertools.permutations(txs):
+            with self.subTest(order=[t.txid for t in order]):
+                db = self.fresh_db()
+                for t in order:
+                    db.add_tx(t)
+                scoped = dict(db.query("SELECT txid, is_spent FROM addr_out"))
+                full_spent_recompute(db)
+                self.assertEqual(scoped, dict(db.query("SELECT txid, is_spent FROM addr_out")))
+                self.assertEqual(scoped["P"], 1, "two spenders, one flag")
+
+    def test_a_reindex_that_drops_an_input_releases_the_output(self):
+        # Unreachable while a txid pins its own content, so the release is
+        # derived rather than assumed.
+        self.db.add_tx(self.parent(300))
+        self.db.add_tx(self.child())
+        self.assertEqual(self.is_spent("P"), True)
+        self.db.add_tx(tx("C", None, [("addr1", POKE, 2)]))   # same txid, no input
+        self.assertEqual(self.is_spent("P"), False, "C no longer spends P:0")
 
 
 class TotalCoinbaseCacheTest(DBTestCase):
