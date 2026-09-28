@@ -20,17 +20,35 @@ PIDDIR="$DIR/.run"
 IDX_PID="$PIDDIR/indexer.pid"
 WEB_PID="$PIDDIR/web.pid"
 STOP_TIMEOUT=10
+# Launched below, and matched against /proc/<pid>/cmdline when stopping, so the
+# two cannot drift apart.
+IDX_SCRIPT="indexer.py"
+WEB_SCRIPT="server.py"
 
 mkdir -p "$PIDDIR"
 
 alive() { kill -0 "$1" 2>/dev/null; }
+
+# True when $1 is a live process whose command line mentions $2. A pidfile
+# holds a bare pid and pids get recycled, so a stale one can name a stranger and
+# kill -TERM would reach an unrelated process. Refusing to signal what we cannot
+# identify is the whole point; the cost is that a stop needs a manual kill where
+# the check cannot be made at all (no /proc), which is loud rather than silent.
+# $2 must be a substring of what start_all actually launches.
+is_ours() {
+  local pid="$1" marker="$2" cmd
+  alive "$pid" || return 1
+  [ -r "/proc/$pid/cmdline" ] || return 1
+  cmd="$(tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null)" || return 1
+  case "$cmd" in *"$marker"*) return 0 ;; *) return 1 ;; esac
+}
 
 read_pid() {
   if [ -s "$1" ]; then cat "$1"; else echo ""; fi
 }
 
 stop_one() {
-  local pidf="$1" name="$2"
+  local pidf="$1" name="$2" marker="$3"
   local pid
   pid="$(read_pid "$pidf")"
   if [ -z "$pid" ]; then
@@ -42,16 +60,31 @@ stop_one() {
     rm -f "$pidf"
     return 0
   fi
+  if ! is_ours "$pid" "$marker"; then
+    echo "refused: $name pidfile holds pid $pid, which is not $marker -- left alone"
+    echo "         running: $(cmdline "$pid")"
+    echo "         if that is not ours, remove $pidf; if it is, kill $pid by hand"
+    rm -f "$pidf"
+    return 0
+  fi
   kill -TERM "$pid" 2>/dev/null || true
-  local waited=0
-  while alive "$pid" && [ "$waited" -lt "$STOP_TIMEOUT" ]; do
+  # SECONDS is a clock, not a loop count. Counting sleep 0.2 iterations against
+  # a seconds timeout gave 2s under a name that claimed 10, and the message
+  # repeated the nominal figure rather than the elapsed one.
+  local started=$SECONDS deadline=$((SECONDS + STOP_TIMEOUT))
+  while alive "$pid" && [ "$SECONDS" -lt "$deadline" ]; do
     sleep 0.2
-    waited=$((waited + 1))
   done
   if alive "$pid"; then
-    echo "stopped: $name (pid $pid) still alive after ${STOP_TIMEOUT}s, SIGKILL"
-    kill -KILL "$pid" 2>/dev/null || true
-    while alive "$pid"; do sleep 0.1; done
+    if is_ours "$pid" "$marker"; then
+      echo "stopped: $name (pid $pid) still alive after $((SECONDS - started))s, SIGKILL"
+      kill -KILL "$pid" 2>/dev/null || true
+      while alive "$pid"; do sleep 0.1; done
+    else
+      # It exited and something else took the pid while we were waiting. The
+      # post-KILL wait would spin on that stranger forever, so stop here.
+      echo "refused: $name pid $pid was recycled while stopping -- left alive"
+    fi
   else
     echo "stopped: $name (pid $pid) exited cleanly"
   fi
@@ -59,39 +92,48 @@ stop_one() {
 }
 
 stop_all() {
-  stop_one "$IDX_PID" "indexer"
-  stop_one "$WEB_PID" "web"
+  stop_one "$IDX_PID" "indexer" "$IDX_SCRIPT"
+  stop_one "$WEB_PID" "web" "$WEB_SCRIPT"
 }
 
 cmdline() {
   ps -p "$1" -o args= 2>/dev/null || true
 }
 
-status_all() {
-  local pair pidf name pid
-  for pair in "$IDX_PID:indexer" "$WEB_PID:web"; do
-    pidf="${pair%%:*}"
-    name="${pair##*:}"
-    pid="$(read_pid "$pidf")"
-    if [ -n "$pid" ] && alive "$pid"; then
+status_one() {
+  local pidf="$1" name="$2" marker="$3" pid
+  pid="$(read_pid "$pidf")"
+  if [ -n "$pid" ] && alive "$pid"; then
+    if is_ours "$pid" "$marker"; then
       echo "$name: running (pid $pid) $(cmdline "$pid")"
     else
-      echo "$name: not running"
-      [ -f "$pidf" ] && rm -f "$pidf"
+      echo "$name: pidfile holds pid $pid, which is not $marker"
+      echo "         running: $(cmdline "$pid")"
     fi
-  done
+  else
+    echo "$name: not running"
+    # An if, not `test && rm`: as the last command in the branch that form
+    # returns 1 when there is no stale pidfile to remove, and set -e turns that
+    # into status exiting 1 on a system where nothing is running.
+    if [ -f "$pidf" ]; then rm -f "$pidf"; fi
+  fi
+}
+
+status_all() {
+  status_one "$IDX_PID" "indexer" "$IDX_SCRIPT"
+  status_one "$WEB_PID" "web" "$WEB_SCRIPT"
 }
 
 start_all() {
   stop_all
   sleep 0.5
-  setsid nohup python3 -u indexer.py "$DB" \
+  setsid nohup python3 -u "$IDX_SCRIPT" "$DB" \
     --rpcuser "$RPCUSER" --rpcpassword "$RPCPASSWORD" \
     --host "$RPCHOST" --port "$RPCPORT" \
     >> "$DIR/indexer.log" 2>&1 &
   echo $! > "$IDX_PID"
   echo "indexer:  pid $! -> log $DIR/indexer.log"
-  setsid nohup python3 -u server.py "$DB" \
+  setsid nohup python3 -u "$WEB_SCRIPT" "$DB" \
     --host "$WEBHOST" --port "$WEBPORT" \
     >> "$DIR/server_web.log" 2>&1 &
   echo $! > "$WEB_PID"
