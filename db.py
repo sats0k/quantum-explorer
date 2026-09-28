@@ -328,14 +328,44 @@ class DB:
         output two known txs both spend still counts as spent after either one
         is re-indexed or removed. Every writer goes through here, which is what
         makes the flag independent of the order txs were added in.
+
+        Batched, because this was the last statement left that scaled with the
+        work: an eviction or a reorg hands us a pair per output affected, and a
+        statement each made it the dominant cost of the operation. The pairs
+        ride a CTE so the WHERE clause stays a join rather than a growing list
+        of OR terms, and the EXISTS is still evaluated per row against the
+        post-delete vin table -- the same answer the loop gave, in ~n/250
+        statements.
         """
-        for txid, n in outputs:
+        outputs = list(dict.fromkeys(tuple(o) for o in outputs))
+        per = max(1, SQL_VAR_CHUNK // 2)       # two binds per (txid, n) pair
+        for i in range(0, len(outputs), per):
+            chunk = outputs[i:i + per]
             self.conn.execute(
-                """UPDATE addr_out SET is_spent = EXISTS (
-                     SELECT 1 FROM vin
-                     WHERE vin.prev_txid=? AND vin.prev_vout=?)
-                   WHERE txid=? AND n=?""",
-                (txid, n, txid, n))
+                """WITH p(txid, n) AS (VALUES %s)
+                   UPDATE addr_out SET is_spent = EXISTS (
+                       SELECT 1 FROM vin
+                       WHERE vin.prev_txid = addr_out.txid
+                         AND vin.prev_vout = addr_out.n)
+                   WHERE (addr_out.txid, addr_out.n) IN (SELECT txid, n FROM p)"""
+                % ",".join(["(?,?)"] * len(chunk)),
+                [x for pair in chunk for x in pair])
+
+    def _delete_tx_rows(self, txids):
+        """Delete every row derived from these txids, and nothing else.
+
+        The single place the four transaction tables are dropped, so a re-index
+        and an eviction cannot drift apart on what a tx consists of. The caller
+        owns the transaction: this is a slice of a larger atomic operation --
+        a re-index that also re-inserts, an eviction that also repairs
+        addr_out.is_spent and rebuilds the scripts -- not an operation of its
+        own, which is why it does not repair anything.
+        """
+        for chunk in _chunks(txids):
+            marks = ",".join("?" * len(chunk))
+            for table in ("txs", "vin", "vout", "addr_out"):
+                self.conn.execute(
+                    "DELETE FROM %s WHERE txid IN (%s)" % (table, marks), chunk)
 
     def _clear_from(self, height):
         # Reorged-away confirmed txs become explicit tombstones instead of
@@ -419,10 +449,7 @@ class DB:
             "SELECT DISTINCT prev_txid, prev_vout FROM vin "
             "WHERE txid=? AND prev_txid IS NOT NULL", (t.txid,))
             if r not in held]
-        self.conn.execute("DELETE FROM txs WHERE txid=?", (t.txid,))
-        self.conn.execute("DELETE FROM vin WHERE txid=?", (t.txid,))
-        self.conn.execute("DELETE FROM vout WHERE txid=?", (t.txid,))
-        self.conn.execute("DELETE FROM addr_out WHERE txid=?", (t.txid,))
+        self._delete_tx_rows([t.txid])
         self.conn.execute(
             """INSERT INTO txs
                (txid, height, tx_index, version, locktime, size,
@@ -439,11 +466,6 @@ class DB:
                    VALUES (?,?,?,?,?,?,?,?)""",
                 (t.txid, i, ipt.prev_txid, ipt.prev_vout, ipt.coinbase,
                  ipt.script_asm, ipt.script_hex, ipt.sequence))
-            if ipt.coinbase is None and ipt.prev_txid:
-                # mark the previous output as spent
-                self.conn.execute(
-                    "UPDATE addr_out SET is_spent=1 "
-                    "WHERE txid=? AND n=?", (ipt.prev_txid, ipt.prev_vout))
         for n, ot in enumerate(t.vout):
             sh = script_hash_of(ot.script_hex)
             self.conn.execute(
@@ -492,14 +514,16 @@ class DB:
                        """,
                     (sh, ot.type, ot.req_sigs,
                      json.dumps(ot.addresses), t.height, t.height))
-        # is_spent is a fact about vin, not something the INSERT above gets to
-        # decide. The input loop can only mark a prevout spent if the output is
-        # already in addr_out, which misses a child indexed before its parent,
-        # and a re-index misses it too: the rows are deleted and rebuilt over
-        # the column default. One extra indexed seek per output, in the noise of
-        # the add itself.
+        # is_spent is a fact about vin, not something the INSERTs above get to
+        # decide, and this is the only place that writes it. Deriving it in the
+        # input loop instead would miss a child indexed before its parent, and
+        # miss a re-index too: the rows are deleted and rebuilt over the column
+        # default. So recompute the three sets the INSERTs above could have got
+        # wrong -- this version's inputs (marked spent by the vin rows just
+        # written), its own outputs, and the prevouts a previous version held
+        # that this one does not -- in one batched pass at the end.
         self._refresh_spent_flags(
-            [(t.txid, n) for n, _ in enumerate(t.vout)] + released)
+            sorted(held) + [(t.txid, n) for n, _ in enumerate(t.vout)] + released)
 
     def remove_tx(self, txid):
         """Drop a tx and every row derived from it (stale mempool eviction).
@@ -562,9 +586,7 @@ class DB:
             # Four statements per chunk rather than per tx: the tables are
             # independent, and batching the deletes takes a whole-mempool
             # eviction from ~4 statements per stale tx to ~6 per 500.
-            for table in ("txs", "vin", "vout", "addr_out"):
-                self.conn.execute(
-                    "DELETE FROM %s WHERE txid IN (%s)" % (table, marks), chunk)
+            self._delete_tx_rows(chunk)
         # An output any of them spent may have no spender left. EXISTS runs
         # against the post-delete table, so it also covers the case where the
         # last spender was itself in this batch.

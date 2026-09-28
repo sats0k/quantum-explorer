@@ -495,6 +495,19 @@ class ScriptBalanceTest(DBTestCase):
         self.assertEqual(b["confirmed"]["n_spent"], 1)
         self.assertEqual(b["confirmed"]["balance"], 0)
 
+    def test_a_reindex_replaces_the_row_in_every_table(self):
+        # _add_tx drops the previous version through the same helper an eviction
+        # uses, so a tx seen again leaves one row per table, not one per sighting.
+        for height in (200, 250, 300):
+            self.db.add_tx(tx("A", height,
+                              [("addr0", POKE, 1), ("addr1", POKE, 2)],
+                              coinbase=True))
+        self.assertEqual(self.db.query("SELECT height FROM txs")[0][0], 300)
+        for table, want in (("txs", 1), ("vin", 1), ("vout", 2), ("addr_out", 2)):
+            self.assertEqual(
+                self.db.query("SELECT COUNT(*) FROM " + table)[0][0], want,
+                "%s kept a row from a previous version of A" % table)
+
     def test_mempool_only_script_has_no_height(self):
         self.db.add_tx(tx("A", None, [("addr0", POKE, 1)], coinbase=True))
         b = self.balances()
@@ -1058,6 +1071,47 @@ class AddOrderSpentFlagTest(DBTestCase):
         self.assertEqual(self.is_spent("P"), True)
         self.db.add_tx(tx("C", None, [("addr1", POKE, 2)]))   # same txid, no input
         self.assertEqual(self.is_spent("P"), False, "C no longer spends P:0")
+
+    def spend_fan(self, n):
+        """n confirmed txs, each with one output, and n mempool txs spending
+        them one for one. Returns the spender txids."""
+        spenders = ["S%05d" % i for i in range(n)]
+        with self.db.bulk():
+            for i in range(n):
+                self.db.add_tx(tx("T%05d" % i, i, [("addr%d" % i, POKE, 1)],
+                                 coinbase=True))
+            for i, s in enumerate(spenders):
+                self.db.add_tx(tx(s, None, [("addr%dx" % i, POKE, 1)],
+                                 spends=[("T%05d" % i, 0)]))
+        return spenders
+
+    def test_a_refresh_past_one_chunk_agrees_with_a_full_recompute(self):
+        # The refresh is batched, so the pairs have to survive being split
+        # across statements. Ground truth is full_spent_recompute, an
+        # independent implementation, not the same batching.
+        n = db_module.SQL_VAR_CHUNK * 2
+        spenders = self.spend_fan(n)
+        self.db.remove_txs(spenders[:int(n * 0.6)])     # 600 pairs, 3 chunks
+        scoped = dict(self.db.query("SELECT txid, is_spent FROM addr_out"))
+        full_spent_recompute(self.db)
+        self.assertEqual(
+            scoped, dict(self.db.query("SELECT txid, is_spent FROM addr_out")))
+        self.assertEqual(sum(1 for v in scoped.values() if v),
+                         n - int(n * 0.6), "the survivors are still spent")
+
+    def test_a_refresh_costs_a_statement_per_chunk_not_per_output(self):
+        n = db_module.SQL_VAR_CHUNK * 2
+        spenders = self.spend_fan(n)
+        seen = []
+        self.db.conn.set_trace_callback(seen.append)
+        self.db.remove_txs(spenders)
+        self.assertEqual(self.db.query("SELECT COUNT(*) FROM addr_out"
+                                       " WHERE is_spent=1")[0][0], 0)
+        ups = [s for s in seen if "UPDATE addr_out" in s]
+        self.assertLessEqual(
+            len(ups), n // (db_module.SQL_VAR_CHUNK // 2) + 1,
+            "%d statements to refresh %d outputs: the batching is not being used"
+            % (len(ups), n))
 
 
 class ShorterChainTest(DBTestCase):
