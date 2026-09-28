@@ -269,21 +269,42 @@ class Explorer:
             "SELECT txid, n, value, type, is_spent FROM addr_out "
             "WHERE address=? ORDER BY txid, n LIMIT ?",
             (addr, self.ADDR_OUT_LIMIT))
-        related = self.db.query(
-            "SELECT DISTINCT txid FROM addr_out WHERE address=? "
-            "ORDER BY txid LIMIT ?", (addr, self.ADDR_OUT_LIMIT))
-        # is_spent is live (a mempool spend sets it), so per-output status is
-        # reported as both readings rather than one "spent" flag.
-        spent_confirmed = {(r[0], r[1]) for r in self.db.query(
-            "SELECT DISTINCT i.prev_txid, i.prev_vout FROM vin i "
-            "JOIN txs t ON t.txid = i.txid "
-            "JOIN addr_out a ON a.txid = i.prev_txid AND a.n = i.prev_vout "
-            "WHERE a.address=? AND t.status='confirmed'", (addr,))}
+        # Every transaction spending one of this address's outputs, in a single
+        # enumeration. The per-output spent_confirmed set and the spending half
+        # of the txs list both come from it, so a busy address is not walked
+        # twice for the two purposes; is_spent is live (a mempool spend sets it),
+        # so per-output status is reported as both readings rather than one
+        # "spent" flag.
+        spends = self.db.query(
+            "SELECT i.txid, i.prev_txid, i.prev_vout, t.status FROM vin i"
+            " JOIN txs t ON t.txid = i.txid"
+            " JOIN addr_out a ON a.txid = i.prev_txid AND a.n = i.prev_vout"
+            " WHERE a.address=?", (addr,))
+        spend_txids = set()
+        spent_confirmed = set()
+        for txid, prev_txid, prev_vout, status in spends:
+            spend_txids.add(txid)
+            if status == "confirmed":
+                spent_confirmed.add((prev_txid, prev_vout))
+        # Transactions touching the address from either side: the receiving ones
+        # straight from addr_out (the primary key streams them in txid order),
+        # unioned with the spenders above, deduped and sorted in Python. The
+        # list used to be built from addr_out alone, so an address whose every
+        # received coin was later spent ended its tx history at the last payout
+        # -- the transactions that moved those coins back out were invisible,
+        # and n_txs understated the participation.
+        involved = sorted(set(r[0] for r in self.db.query(
+            "SELECT DISTINCT txid FROM addr_out WHERE address=?", (addr,)))
+            | spend_txids)
+        n_txs = len(involved)
+        txs = involved[:self.ADDR_OUT_LIMIT]
         return {
             "address": addr,
             "confirmed": with_hex(bal["confirmed"]),
             "live": with_hex(bal["live"]),
-            "txs": [r[0] for r in related],
+            "txs": txs,
+            "n_txs": n_txs,
+            "txs_truncated": n_txs > self.ADDR_OUT_LIMIT,
             "n_outputs": n_out,
             "outputs_truncated": n_out > self.ADDR_OUT_LIMIT,
             "outputs": [

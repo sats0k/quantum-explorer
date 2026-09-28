@@ -264,7 +264,11 @@ class Indexer:
             txids = self.rpc.getrawmempool()
         except RPCError as e:
             print("mempool failed: %s" % e)
-            return []
+            # None, not []: the caller must be able to tell "we could not ask"
+            # from "the daemon says it is empty". run_once() skips the stale
+            # sweep on None, because treating an unanswered getrawmempool as an
+            # empty one deleted every pending row and reverted their spends.
+            return None
         pending = []
         if txids:
             # Which of these we already track, asked by txid -- the primary key --
@@ -329,6 +333,13 @@ class Indexer:
     def run_once(self):
         self.sync_blocks()
         txids = self.sync_mempool()
+        if txids is None:
+            # The daemon did not answer. On an RPCError sync_mempool() used to
+            # return [] and this sweep read it as "mempool just emptied", being
+            # unable to tell a failure from a genuinely empty reply: every
+            # pending row was deleted and its spends reverted. Keep the set we
+            # already track until we have a real answer.
+            return
         self.close_stale_mempool(txids)
 
     def run(self, interval):

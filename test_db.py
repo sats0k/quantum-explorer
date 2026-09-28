@@ -449,6 +449,23 @@ class MultisigCreditTest(DBTestCase):
                          40 * POKE)
         self.assertEqual(self.db.query("SELECT COUNT(*) FROM addr_out")[0][0], 1)
 
+    def test_txs_list_covers_both_the_receipt_and_the_spend(self):
+        # The list used to be built from addr_out alone, so an address whose
+        # every output was spent had its tx history end at the last payout; the
+        # transaction moving its coins back out never appeared. Both sides must
+        # be listed, and a tx counted once even when it both receives and
+        # spends (the set union dedupes).
+        self.db.add_tx(tx("PAY", 100, [("addr0", POKE, 1)], coinbase=True))
+        self.db.add_tx(tx("SPEND", None, [], spends=[("PAY", 0)]))
+        self.db.add_tx(tx("CYCLE", None, [("addr0", POKE, 19)],
+                          spends=[("PAY", 0)]))
+        a = self.explorer.address("addr0")
+        self.assertEqual(a["n_txs"], 3)
+        self.assertFalse(a["txs_truncated"])
+        self.assertIn("PAY", a["txs"])
+        self.assertIn("SPEND", a["txs"])
+        self.assertIn("CYCLE", a["txs"])
+
 
 class ScriptBalanceTest(DBTestCase):
     def add_pair(self, b_height=None):
@@ -1365,6 +1382,25 @@ class MempoolRefreshTest(DBTestCase):
         self.assertEqual(self.refresh(daemon), live)
         self.assertEqual(daemon.fetched, live[1000:],
                          "only the 100 untracked txs are worth an RPC")
+
+    def test_a_failed_mempool_fetch_skips_the_stale_sweep(self):
+        # sync_mempool() used to return [] on an RPCError, and run_once() fed
+        # that straight to close_stale_mempool(), which cannot tell an empty
+        # reply from an unanswered one and deleted every pending row -- with the
+        # spends depending on them reverting. The failure has to leave the
+        # previously indexed mempool standing until the daemon answers again.
+        self.db.add_tx(tx("C", 500, [("addr0", POKE, 1)], coinbase=True))
+        self.db.add_tx(tx("M", None, [("addr1", POKE, 2)], spends=[("C", 0)]))
+        daemon = FakeDaemon(500)
+        daemon.getrawmempool = lambda: (_ for _ in ()).throw(RPCError("down"))
+        self.indexer.rpc = daemon
+        with mock.patch.object(Indexer, "sync_blocks") as sync:
+            self.indexer.run_once()
+        sync.assert_called_once()
+        self.assertEqual(self.is_spent("C"), True,
+                         "M still spends C:0, so the spend flag survives")
+        self.assertEqual(self.db.query(
+            "SELECT status FROM txs WHERE txid='M'")[0][0], "mempool")
 
 
 class TotalCoinbaseCacheTest(DBTestCase):
