@@ -31,16 +31,22 @@ POKE = 100_000_000
 
 
 class FakeDaemon:
-    """The RPC surface sync_blocks() uses, over a chain of `tip` blocks.
+    """The RPC surface the indexer uses, over a chain of `tip` blocks.
 
     A block hashes as "b<height>", so `hashes` can be used to make the daemon's
     chain differ from the indexed one at a height both agree on. getblockhash
     past the tip raises, the way a real daemon answers a height it does not have.
+
+    `mempool` is the live set getrawmempool reports; `fetched` records which
+    txids sync_mempool actually asked for, so a test can tell "already tracked"
+    from "refetched". A txid the daemon does not know raises, as it would.
     """
 
-    def __init__(self, tip, hashes=None):
+    def __init__(self, tip, hashes=None, mempool=()):
         self.tip = tip
         self.hashes = hashes or {}
+        self.mempool = list(mempool)
+        self.fetched = []
 
     def hash_at(self, height):
         return self.hashes.get(height, "b%04d" % height)
@@ -59,6 +65,20 @@ class FakeDaemon:
         return {"height": height, "hash": self.hash_at(height), "tx": [],
                 "previousblockhash":
                     self.hash_at(height - 1) if height else None}
+
+    def getrawmempool(self):
+        return list(self.mempool)
+
+    def getrawtransaction(self, txid, verbose=True):
+        self.fetched.append(txid)
+        if txid not in self.mempool:
+            raise RPCError("No such mempool transaction: %s" % txid)
+        return {"txid": txid, "version": 1, "locktime": 0, "size": 100,
+                "vin": [{"txid": "prev", "vout": 0, "sequence": 0xFFFFFFFF}],
+                "vout": [{"value": Decimal("1.5"), "n": 0,
+                          "scriptPubKey": {
+                              "type": "pubkeyhash", "addresses": ["addr1"],
+                              "reqSigs": 1, "asm": "OP_DUP", "hex": "76a914"}}]}
 
     def batch(self, calls, strict=True):
         out = []
@@ -992,6 +1012,112 @@ class ShorterChainTest(DBTestCase):
         self.assertEqual(self.db.tip_height(), 1003)
         self.indexer.sync_blocks()
         self.assertEqual(self.db.tip_height(), 1003)
+
+
+class MempoolRefreshTest(DBTestCase):
+    """sync_mempool() must cost what the mempool costs, not what the index costs.
+
+    Deciding which mempool txs are new used to read every confirmed txid in the
+    index into a Python set, once a second, to compare against a mempool of a
+    few dozen. The membership test is now a primary-key lookup per mempool txid,
+    so a refresh no longer slows down as the chain grows.
+    """
+
+    def index_confirmed(self, n, base=0):
+        for i in range(n):
+            self.db.add_tx(tx("C%06d" % (base + i), base + i,
+                              [("addr%d" % i, POKE, (i % 90) + 1)],
+                              coinbase=True))
+
+    def refresh(self, daemon):
+        self.indexer.rpc = daemon
+        return self.indexer.sync_mempool()
+
+    def queries_during(self, daemon):
+        """The SQL sync_mempool() issues, with its plans and row counts."""
+        seen = []
+        real = DB.query
+
+        def spy(db, sql, params=()):
+            rows = real(db, sql, params)
+            seen.append((sql, list(params),
+                         [r[-1] for r in db.conn.execute(
+                             "EXPLAIN QUERY PLAN " + sql, params)], len(rows)))
+            return rows
+
+        with mock.patch.object(DB, "query", spy):
+            self.indexer.rpc = daemon
+            self.indexer.sync_mempool()
+        return seen
+
+    def test_the_membership_lookup_is_a_primary_key_seek(self):
+        # The property that makes it cheap: no statement may fall back to
+        # scanning the status index, which is a full pass over the chain.
+        self.index_confirmed(500)
+        for sql, _, plans, _ in self.queries_during(
+                FakeDaemon(499, mempool=["m1", "m2"])):
+            for plan in plans:
+                self.assertNotIn("idx_txs_status_height", plan, sql)
+                self.assertIn("sqlite_autoindex_txs_1", plan, sql)
+
+    def test_a_refresh_does_not_read_the_whole_index(self):
+        # One query is not the same as a cheap query: the old form asked for
+        # every confirmed txid in one statement, so a 500-tx chain came back as
+        # 500 rows to be turned into a set, once a second.
+        self.index_confirmed(500)
+        read = sum(rows for _, _, _, rows in
+                   self.queries_during(FakeDaemon(499, mempool=["m1", "m2"])))
+        self.assertLessEqual(read, 2,
+                             "checking 2 mempool txs read %d rows" % read)
+
+    def test_a_known_mempool_tx_is_not_refetched(self):
+        self.db.add_tx(tx("M", None, [("addr1", POKE, 2)], spends=[("C", 0)]))
+        daemon = FakeDaemon(9, mempool=["M"])
+        self.assertEqual(self.refresh(daemon), ["M"])
+        self.assertEqual(daemon.fetched, [],
+                         "already tracked: refetching it every second is the cost")
+
+    def test_a_new_mempool_tx_is_fetched_and_added(self):
+        daemon = FakeDaemon(9, mempool=["M"])
+        self.assertEqual(self.refresh(daemon), ["M"])
+        self.assertEqual(daemon.fetched, ["M"])
+        self.assertEqual(self.db.query(
+            "SELECT status, height FROM txs WHERE txid='M'"), [("mempool", None)])
+
+    def test_an_orphaned_tx_reappearing_is_refetched(self):
+        # A reorg drops a tx to a tombstone; when it comes back it has to be
+        # fetched again, which is why tombstones are not in the known set.
+        self.db.add_tx(tx("M", 500, [("addr1", POKE, 2)], coinbase=True))
+        self.db.clear_from(500)
+        self.assertEqual(self.db.query(
+            "SELECT status FROM txs WHERE txid='M'")[0][0], "orphaned")
+        daemon = FakeDaemon(9, mempool=["M"])
+        self.assertEqual(self.refresh(daemon), ["M"])
+        self.assertEqual(daemon.fetched, ["M"])
+        self.assertEqual(self.db.query(
+            "SELECT status, height FROM txs WHERE txid='M'")[0][0], "mempool")
+
+    def test_a_confirmed_tx_the_daemon_lists_stays_confirmed(self):
+        # The daemon can name a tx we hold as confirmed only if it reorged it
+        # out, which clear_from() has normally already turned into a tombstone.
+        # Keeping it confirmed until then is the conservative reading: a flip
+        # to mempool would let close_stale_mempool() delete a tx that is still
+        # on the chain, and a deleted tx is never re-indexed.
+        self.db.add_tx(tx("M", 500, [("addr1", POKE, 2)], coinbase=True))
+        daemon = FakeDaemon(9, mempool=["M"])
+        self.assertEqual(self.refresh(daemon), ["M"])
+        self.assertEqual(daemon.fetched, [])
+        self.assertEqual(self.db.query(
+            "SELECT status, height FROM txs WHERE txid='M'")[0][0], "confirmed")
+
+    def test_a_mempool_larger_than_one_chunk_still_matches_everything(self):
+        live = ["M%03d" % i for i in range(1100)]
+        for txid in live[:1000]:
+            self.db.add_tx(tx(txid, None, [("addr1", POKE, 2)], coinbase=True))
+        daemon = FakeDaemon(9, mempool=live)
+        self.assertEqual(self.refresh(daemon), live)
+        self.assertEqual(daemon.fetched, live[1000:],
+                         "only the 100 untracked txs are worth an RPC")
 
 
 class TotalCoinbaseCacheTest(DBTestCase):
