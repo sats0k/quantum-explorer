@@ -10,6 +10,26 @@ class RPCError(Exception):
     pass
 
 
+class CallError(Exception):
+    """A failed call inside a non-strict batch.
+
+    The daemon's answer to an errored call is a JSON-RPC error object *inside*
+    a batch reply that itself succeeded, so there is nothing to raise -- but
+    the caller still needs to know the failure happened and why. Collapsing it
+    to None made "the daemon says it cannot resolve this tx" and "the request
+    hiccuped" indistinguishable, so the first permanent case and the second
+    transient one were treated alike. Carrying the code and message back lets
+    the caller tell them apart.
+    """
+
+    def __init__(self, method, index, code=None, message=""):
+        super().__init__("batch %s[%d] failed: %s" % (method, index, message))
+        self.method = method
+        self.index = index
+        self.code = code
+        self.message = message
+
+
 class RPC:
     def __init__(self, host="127.0.0.1", port=9554, user="user", password="pass",
                  timeout=120):
@@ -32,9 +52,11 @@ class RPC:
         `error` has to be inspected first -- a plain `"result" in reply` test
         turns every error into a silent None.
 
-        With strict=False a failed call yields None in its slot instead, so one
-        bad call doesn't discard the whole window (a batch reply comes back
-        HTTP 200; only a single-call failure is HTTP 500)."""
+        With strict=False a failed call yields a CallError in its slot instead of
+        a result, so one bad call doesn't discard the whole window (a batch reply
+        comes back HTTP 200; only a single-call failure is HTTP 500). The error's
+        code and message ride along for the caller to classify.
+        """
         body = json.dumps([
             {"method": m, "params": list(p), "id": i}
             for i, (m, p) in enumerate(calls)
@@ -57,11 +79,12 @@ class RPC:
                 msg = err.get("message") if isinstance(err, dict) else str(err)
                 if strict:
                     raise RPCError("batch %s[%d] failed: %s" % (c[0], i, msg))
-                out.append(None)
+                out.append(CallError(
+                    c[0], i, code=err.get("code"), message=msg))
             elif "result" not in r:
                 if strict:
                     raise RPCError("batch %s[%d] got no result" % (c[0], i))
-                out.append(None)
+                out.append(CallError(c[0], i, message="no result"))
             else:
                 out.append(r["result"])
         return out

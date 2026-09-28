@@ -19,12 +19,13 @@ import unittest
 from unittest import mock
 
 import db as db_module
+import indexer as indexer_module
 import server as server_module
 from decimal import Decimal
 from db import DB, script_hash_of
 from indexer import (Block, Indexer, In, Out, Tx, amount_to_pokes,
                      tx_from_verbose)
-from rpc import RPCError
+from rpc import CallError, RPCError
 from server import DBPool, Explorer, poke
 
 POKE = 100_000_000
@@ -82,14 +83,34 @@ class FakeDaemon:
 
     def batch(self, calls, strict=True):
         out = []
-        for method, params in calls:
+        for i, (method, params) in enumerate(calls):
             try:
                 out.append(getattr(self, method)(*params))
-            except RPCError:
+            except RPCError as e:
                 if strict:
                     raise
-                out.append(None)
+                out.append(CallError(method, i, message=str(e)))
         return out
+
+
+def block_at(daemon, height, txids=()):
+    return {"height": height, "hash": daemon.hash_at(height),
+            "tx": list(txids),
+            "previousblockhash":
+                daemon.hash_at(height - 1) if height else None}
+
+
+class BlockDaemon(FakeDaemon):
+    """A FakeDaemon whose blocks name their transactions, so sync_blocks has
+    something to fetch detail for (FakeDaemon's blocks are empty)."""
+
+    def __init__(self, tip, txids_at, **kw):
+        super().__init__(tip, **kw)
+        self.txids_at = txids_at
+
+    def getblock(self, blockhash):
+        height = int(blockhash[1:])
+        return block_at(self, height, self.txids_at.get(height, ()))
 
 
 def script_hex(tag):
@@ -1401,6 +1422,85 @@ class MempoolRefreshTest(DBTestCase):
                          "M still spends C:0, so the spend flag survives")
         self.assertEqual(self.db.query(
             "SELECT status FROM txs WHERE txid='M'")[0][0], "mempool")
+
+
+class TxRetrievalDialogTest(DBTestCase):
+    """How sync_blocks treats a getrawtransaction that refuses mid-window.
+
+    A per-slot refusal inside a successful batch used to stub the tx forever;
+    the daemon's "no information" (permanent) and a transient hiccup were
+    indistinguishable. The stub answer first pass, the rest are re-asked.
+    """
+
+    def vers(self, txid):
+        return {"txid": txid, "version": 1, "locktime": 0, "size": 100,
+                "vin": [], "vout": [{"value": Decimal("3"), "n": 0,
+                                     "scriptPubKey": {
+                                         "type": "pubkeyhash",
+                                         "addresses": ["addr1"], "reqSigs": 1,
+                                         "asm": "OP_DUP", "hex": "76a914"}}]}
+
+    def daemon(self, txids, fail):
+        """Block 1 carries `txids`; fail(txid, call_no) raises or returns None."""
+        daemon = BlockDaemon(1, {1: txids})
+        calls = {}
+
+        def getrawtransaction(txid, verbose=True):
+            calls[txid] = calls.get(txid, 0) + 1
+            err = fail(txid, calls[txid])
+            if err is not None:
+                raise err
+            return self.vers(txid)
+
+        daemon.getrawtransaction = getrawtransaction
+        daemon.calls = calls
+        return daemon
+
+    def test_a_transient_refusal_is_retried_not_stubbed(self):
+        daemon = self.daemon(
+            ["A", "FLAKY", "B"],
+            lambda t, n: RPCError("connection reset by peer")
+                         if t == "FLAKY" and n == 1 else None)
+        self.indexer.rpc = daemon
+        with mock.patch("indexer.time.sleep"):
+            self.indexer.sync_blocks()
+        self.assertEqual(daemon.calls["FLAKY"], 2,
+                         "the refused slot is re-asked on the next attempt")
+        self.assertEqual(self.db.query(
+            "SELECT COUNT(*) FROM vout WHERE txid='FLAKY'")[0][0], 1,
+                         "detail was indexed, not lost to a stub")
+        self.assertEqual(self.indexer.counters["tx_stub"], 0)
+        self.assertEqual(self.db.query("SELECT COUNT(*) FROM txs")[0][0], 3)
+
+    def test_a_tx_with_no_information_stubs_without_retrying(self):
+        daemon = self.daemon(
+            ["GONE"],
+            lambda t, n: RPCError("No information available about transaction")
+                         if t == "GONE" else None)
+        self.indexer.rpc = daemon
+        with mock.patch("indexer.time.sleep"):
+            self.indexer.sync_blocks()
+        self.assertEqual(daemon.calls["GONE"], 1,
+                         "a refusal that will never clear is not re-asked")
+        self.assertEqual(self.indexer.counters["tx_stub"], 1)
+        self.assertEqual(self.db.query(
+            "SELECT COUNT(*) FROM vout WHERE txid='GONE'")[0][0], 0)
+        self.assertEqual(self.db.query(
+            "SELECT COUNT(*) FROM txs WHERE txid='GONE'")[0][0], 1,
+                         "the row survives, just without detail")
+
+    def test_a_never_clearing_refusal_stubs_after_the_cap(self):
+        daemon = self.daemon(
+            ["STUCK"],
+            lambda t, n: RPCError("internal server error")
+                         if t == "STUCK" else None)
+        self.indexer.rpc = daemon
+        with mock.patch("indexer.time.sleep"):
+            self.indexer.sync_blocks()
+        self.assertEqual(daemon.calls["STUCK"],
+                         indexer_module._TX_RETRIES,
+                         "the window is not held open forever")
+        self.assertEqual(self.indexer.counters["tx_stub"], 1)
 
 
 class TotalCoinbaseCacheTest(DBTestCase):

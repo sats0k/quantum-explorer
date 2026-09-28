@@ -19,7 +19,7 @@ import time
 
 from decimal import Decimal
 
-from rpc import RPC, RPCError
+from rpc import CallError, RPC, RPCError
 from db import DB, COIN
 
 TX_TYPES_WITH_ADDRESSES = {
@@ -149,6 +149,25 @@ def tx_stub(txid, height, tx_index, is_coinbase):
     return Tx(txid, height, tx_index, None, None, None, is_coinbase, [], [])
 
 
+# How far a getrawtransaction batch goes before giving up on a slot that
+# failed without looking permanent. One hiccup in a 500-call window used to
+# stub a tx forever; re-batching only the failed slots turns a transient
+# refusal into a properly indexed tx, and a bounded cap keeps a broken daemon
+# from stalling the window indefinitely.
+_TX_RETRIES = 3
+_TX_BACKOFF = 0.5
+
+
+def _stub_worthy(e):
+    # Only a refusal that will never clear -- the daemon has no information for
+    # the tx (this fork has no -txindex, so a confirmed tx with all outputs
+    # spent is permanently unretrievable) -- is worth stubbing on the first
+    # pass. Anything else is a transient refusal and gets the retry loop.
+    if e.code == -5:
+        return True
+    return "no information available about transaction" in e.message.lower()
+
+
 def tx_from_rpc(rpc, txid, height, tx_index):
     j = rpc.getrawtransaction(txid, verbose=True)
     if j is None:
@@ -164,6 +183,19 @@ class Indexer:
         # Set by SIGTERM/SIGINT handler; run() checks it between units of
         # work (never inside a bulk transaction) and exits cleanly.
         self._stop = threading.Event()
+
+    def store_stub(self, txid, height, tx_index, exhausted=False):
+        """Write the placeholder for a tx we will never detail, and count it."""
+        self.counters["tx_stub"] += 1
+        if self.counters["tx_stub"] <= 5:
+            if exhausted:
+                print("getrawtransaction still failing after %d attempts, "
+                      "storing %s at height %d without inputs/outputs"
+                      % (_TX_RETRIES, txid, height))
+            else:
+                print("no txindex: %s at height %d is not retrievable, "
+                      "storing it without inputs/outputs" % (txid, height))
+        self.db.add_tx(tx_stub(txid, height, tx_index, tx_index == 0))
 
     def sync_blocks(self, batch_size=100):
         # Stubs found during THIS call, not the running total: the counters
@@ -232,32 +264,49 @@ class Indexer:
                             txlist.append((h, i, txid))
                     for i in range(0, len(txlist), 500):
                         chunk = txlist[i:i + 500]
-                        txs = self.rpc.batch(
-                            [("getrawtransaction", (txid, 1)) for _, _, txid in chunk],
-                            strict=False)
-                        for (h, idx, txid), j in zip(chunk, txs):
-                            if j is None:
-                                # Unretrievable tx (no -txindex, all outputs
-                                # spent): keep the row, lose the detail.
-                                self.counters["tx_stub"] += 1
-                                stubs += 1
-                                if self.counters["tx_stub"] <= 5:
-                                    print("no txindex: %s at height %d is not "
-                                          "retrievable, storing it without "
-                                          "inputs/outputs" % (txid, h))
-                                self.db.add_tx(
-                                    tx_stub(txid, h, idx, idx == 0))
-                            else:
-                                self.db.add_tx(tx_from_verbose(j, h, idx))
-                            self.counters["tx"] += 1
+                        pending = chunk
+                        for attempt in range(_TX_RETRIES):
+                            if not pending:
+                                break
+                            if attempt:
+                                time.sleep(_TX_BACKOFF * attempt)
+                            txs = self.rpc.batch(
+                                [("getrawtransaction", (txid, 1))
+                                 for _, _, txid in pending],
+                                strict=False)
+                            still = []
+                            for (h, idx, txid), j in zip(pending, txs):
+                                if not isinstance(j, CallError):
+                                    self.db.add_tx(tx_from_verbose(j, h, idx))
+                                elif _stub_worthy(j):
+                                    # Unretrievable tx (no -txindex, all
+                                    # outputs spent), and the refusal is not
+                                    # going to clear: keep the row, lose the
+                                    # detail, no point re-asking.
+                                    self.store_stub(txid, h, idx)
+                                    stubs += 1
+                                else:
+                                    # Not "no information" -- a transient
+                                    # refusal, so whether the slots succeed
+                                    # for everyone else gets another try
+                                    # before anything is given up on.
+                                    still.append((h, idx, txid))
+                            pending = still
+                        for h, idx, txid in pending:
+                            # Retries exhausted for a refusal that never said
+                            # "not found": store the row, lose the detail,
+                            # rather than hold the window open forever.
+                            self.store_stub(txid, h, idx, exhausted=True)
+                            stubs += 1
+                        self.counters["tx"] += len(chunk)
                 self.counters["block"] += len(heights)
                 print("height %d" % min(heights))
                 if self._stop.is_set():
                     return
             self.db.set_meta("last_sync", int(time.time()))
         if stubs:
-            print("note: %d tx(s) stored without inputs/outputs (the daemon "
-                  "runs without -txindex and could not resolve them)" % stubs)
+            print("note: %d tx(s) stored without inputs/outputs "
+                  "(getrawtransaction could not resolve them)" % stubs)
 
     def sync_mempool(self):
         try:
