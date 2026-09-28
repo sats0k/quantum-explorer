@@ -138,6 +138,22 @@ SCHEMA += SCRIPTS_TABLE + "\n" + SCRIPTS_INDEX
 
 ORPHAN_RETENTION = 20000  # tombstones kept this many blocks before pruning
 
+# Bind parameters per statement, chunked. SQLITE_LIMIT_VARIABLE_NUMBER is
+# compiled in: 999 before SQLite 3.32, 32766 after, 250000 in recent versions.
+# An eviction or a reorg hands us an id list whose size we did not choose, and a
+# statement over the cap does not degrade, it raises -- taking the enclosing
+# transaction with it. A mempool past the cap would then never be cleanable, and
+# a reorg past it would never apply, both forever. 500 fits inside the oldest
+# cap with room to spare.
+SQL_VAR_CHUNK = 500
+
+
+def _chunks(seq, size=SQL_VAR_CHUNK):
+    """Yield `seq` in slices of at most `size`, for building IN (...) lists."""
+    seq = list(seq)
+    for i in range(0, len(seq), size):
+        yield seq[i:i + size]
+
 
 class DB:
     # scripts_v2: scripts.created_height/last_height are confirmed-only, so a
@@ -519,27 +535,36 @@ class DB:
             self._remove_txs(txids)
 
     def _remove_txs(self, txids):
-        # Snapshot the prevouts first: the rows go away with the txs, and the
-        # recompute below needs to know which outputs they were holding.
-        spent_prev = self.conn.execute(
-            "SELECT DISTINCT prev_txid, prev_vout FROM vin "
-            "WHERE txid IN (%s) AND prev_txid IS NOT NULL"
-            % ",".join("?" * len(txids)), txids).fetchall()
-        # ...and the scripts these txs' outputs were evidence of, for the same
-        # reason: vout is what rebuild_scripts() aggregates, and it is about to
-        # be empty. Without this a script seen only in the mempool keeps its
-        # row forever, and /api/script/<hash> answers 200 for a script that no
-        # longer exists in the chain or the mempool -- zero balances, but real
-        # type/addresses/height metadata.
-        touched = [r[0] for r in self.conn.execute(
-            "SELECT DISTINCT script_hash FROM vout "
-            "WHERE txid IN (%s) AND script_hash IS NOT NULL"
-            % ",".join("?" * len(txids)), txids)]
-        for txid in txids:
-            self.conn.execute("DELETE FROM txs WHERE txid=?", (txid,))
-            self.conn.execute("DELETE FROM vin WHERE txid=?", (txid,))
-            self.conn.execute("DELETE FROM vout WHERE txid=?", (txid,))
-            self.conn.execute("DELETE FROM addr_out WHERE txid=?", (txid,))
+        # Chunked because a mempool eviction can be longer than SQLite's bind
+        # cap, and one statement cannot hold every stale id. The chunks share
+        # the single transaction remove_txs() opened, so the eviction is still
+        # all-or-nothing: either every stale tx goes or none of it does.
+        spent_prev = []
+        touched = []
+        for chunk in _chunks(txids):
+            marks = ",".join("?" * len(chunk))
+            # Snapshot the prevouts first: the rows go away with the txs, and the
+            # recompute below needs to know which outputs they were holding.
+            spent_prev += self.conn.execute(
+                "SELECT DISTINCT prev_txid, prev_vout FROM vin "
+                "WHERE txid IN (%s) AND prev_txid IS NOT NULL" % marks,
+                chunk).fetchall()
+            # ...and the scripts these txs' outputs were evidence of, for the
+            # same reason: vout is what rebuild_scripts() aggregates, and it is
+            # about to be empty. Without this a script seen only in the mempool
+            # keeps its row forever, and /api/script/<hash> answers 200 for a
+            # script that no longer exists in the chain or the mempool -- zero
+            # balances, but real type/addresses/height metadata.
+            touched += [r[0] for r in self.conn.execute(
+                "SELECT DISTINCT script_hash FROM vout "
+                "WHERE txid IN (%s) AND script_hash IS NOT NULL" % marks,
+                chunk)]
+            # Four statements per chunk rather than per tx: the tables are
+            # independent, and batching the deletes takes a whole-mempool
+            # eviction from ~4 statements per stale tx to ~6 per 500.
+            for table in ("txs", "vin", "vout", "addr_out"):
+                self.conn.execute(
+                    "DELETE FROM %s WHERE txid IN (%s)" % (table, marks), chunk)
         # An output any of them spent may have no spender left. EXISTS runs
         # against the post-delete table, so it also covers the case where the
         # last spender was itself in this batch.
@@ -548,7 +573,8 @@ class DB:
         # elsewhere keeps its row, and the rebuild both restores its metadata
         # and drops the ones nothing is left for. Scoped for the same reason
         # clear_from scopes its own -- one mempool eviction must not re-aggregate
-        # every output in the index.
+        # every output in the index. Chunked too: the scope is every script the
+        # evicted txs touched, which is unbounded on the same terms.
         self.rebuild_scripts(touched)
 
     def query(self, sql, params=()):
@@ -647,26 +673,31 @@ class DB:
         NULLs, so a script that has only ever been seen unconfirmed gets NULL
         for both rather than a sentinel height.
         """
-        if script_hashes is not None:
+        if script_hashes is None:
+            self.conn.execute("DELETE FROM scripts")
+            scopes = [("WHERE v.script_hash IS NOT NULL", ())]
+        else:
             script_hashes = list(dict.fromkeys(script_hashes))
             if not script_hashes:
                 return
             # Same aggregate as the full rebuild, narrowed by an index lookup
-            # instead of grouping the whole table.
-            where = "WHERE v.script_hash IN (%s)" % ",".join(
-                "?" * len(script_hashes))
-        else:
-            self.conn.execute("DELETE FROM scripts")
-            where = "WHERE v.script_hash IS NOT NULL"
-        rows = self.conn.execute(
-            """SELECT v.script_hash, MAX(v.type), MAX(v.req_sigs),
-                      MAX(v.addresses),
-                      MIN(t.height), MAX(t.height)
-               FROM vout v
-               JOIN txs t ON t.txid = v.txid
-               %s
-               GROUP BY v.script_hash""" % where,
-            script_hashes or ()).fetchall()
+            # instead of grouping the whole table. Chunked, because a deep reorg
+            # hands us every script in the chain and one statement cannot bind
+            # that many. The chunks partition the hashes, so no script aggregates
+            # in two of them and the groups concatenate into exactly the rows the
+            # single uncapped statement would have returned.
+            scopes = [("WHERE v.script_hash IN (%s)" % ",".join("?" * len(c)), c)
+                      for c in _chunks(script_hashes)]
+        rows = []
+        for where, params in scopes:
+            rows += self.conn.execute(
+                """SELECT v.script_hash, MAX(v.type), MAX(v.req_sigs),
+                          MAX(v.addresses),
+                          MIN(t.height), MAX(t.height)
+                   FROM vout v
+                   JOIN txs t ON t.txid = v.txid
+                   %s
+                   GROUP BY v.script_hash""" % where, params).fetchall()
         self.conn.executemany(
             """INSERT OR REPLACE INTO scripts
                (script_hash, type, req_sigs, addresses,
@@ -675,11 +706,15 @@ class DB:
         if script_hashes is not None:
             # A script whose every output was severed has nothing left to
             # describe, so it leaves the table -- the same thing the full
-            # rebuild's DELETE would have done to it.
+            # rebuild's DELETE would have done to it. Batched like everything
+            # else here: one DELETE per hash made an eviction cost a statement
+            # per stale tx, which is the cost the chunking is here to remove.
             seen = {r[0] for r in rows}
-            self.conn.executemany(
-                "DELETE FROM scripts WHERE script_hash=?",
-                [(h,) for h in script_hashes if h not in seen])
+            gone = [h for h in script_hashes if h not in seen]
+            for chunk in _chunks(gone):
+                self.conn.execute(
+                    "DELETE FROM scripts WHERE script_hash IN (%s)"
+                    % ",".join("?" * len(chunk)), chunk)
 
     def get_meta(self, key, default=None):
         row = self.conn.execute(

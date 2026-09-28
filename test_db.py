@@ -252,6 +252,136 @@ class MempoolEvictionTest(DBTestCase):
         self.assertEqual(self.is_spent("A"), False)
 
 
+class VariableLimitTest(DBTestCase):
+    """Id lists longer than SQLite's bind cap must not fail.
+
+    SQLITE_LIMIT_VARIABLE_NUMBER is compiled in -- 999 on older builds, 32766
+    since 3.32 -- and a statement over it raises "too many SQL variables" rather
+    than degrading. The caller's transaction rolls that back whole, so the
+    effect is a permanently stuck indexer: a mempool too big to evict, or a
+    reorg too deep to apply, retried forever. The limit is lowered here instead
+    of indexing a 32k-tx mempool, so the test bites on every host.
+    """
+
+    LIMIT = getattr(sqlite3, "SQLITE_LIMIT_VARIABLE_NUMBER", None)
+    NEEDS_SETLIMIT = not hasattr(sqlite3.Connection, "setlimit")
+
+    def setUp(self):
+        super().setUp()
+        if self.NEEDS_SETLIMIT:
+            self.skipTest("needs Connection.setlimit (Python 3.11+)")
+        self.capped = self.db.conn.getlimit(self.LIMIT)
+
+    def cap_variables(self, n):
+        self.db.conn.setlimit(self.LIMIT, n)
+
+    def uncapped(self):
+        self.db.conn.setlimit(self.LIMIT, self.capped)
+
+    def fill_mempool(self, n):
+        """n mempool txs, all one address, none spending anything."""
+        with self.db.bulk():
+            for i in range(n):
+                self.db.add_tx(tx("M%05d" % i, None,
+                                  [("addr%d" % (i % 97), POKE, i + 1)],
+                                  coinbase=True))
+        return ["M%05d" % i for i in range(n)]
+
+    def counts(self):
+        return [self.db.query("SELECT COUNT(*) FROM " + t)[0][0]
+                for t in ("txs", "vin", "vout", "addr_out", "scripts")]
+
+    def test_an_eviction_past_the_bind_cap_works(self):
+        # Two chunks' worth of stale txs, a cap of one chunk: the IN lists in
+        # _remove_txs and the rebuild scope behind them both need the walk.
+        stale = self.fill_mempool(db_module.SQL_VAR_CHUNK * 2)
+        self.cap_variables(db_module.SQL_VAR_CHUNK)
+        self.indexer.close_stale_mempool([])      # every tx is stale
+        self.assertEqual(self.counts(), [0, 0, 0, 0, 0])
+
+    def test_the_eviction_state_is_the_same_chunked_or_not(self):
+        # The point of chunking is that it changes nothing but the statement
+        # sizes, so check the capped result against the uncapped one.
+        stale = self.fill_mempool(db_module.SQL_VAR_CHUNK * 2)
+        self.cap_variables(db_module.SQL_VAR_CHUNK)
+        self.indexer.close_stale_mempool([])
+        chunked = self.counts()
+        self.assertEqual(chunked, [0, 0, 0, 0, 0],
+                         "the capped eviction should have left nothing")
+
+        db = self.fresh_db()
+        with db.bulk():
+            for i in range(len(stale)):
+                db.add_tx(tx(stale[i], None,
+                             [("addr%d" % (i % 97), POKE, i + 1)], coinbase=True))
+        db.remove_txs(stale)                      # host cap: one statement
+        self.assertEqual([db.query("SELECT COUNT(*) FROM " + t)[0][0]
+                          for t in ("txs", "vin", "vout", "addr_out", "scripts")],
+                         chunked)
+
+    def test_a_chunked_eviction_is_still_one_transaction(self):
+        # Chunking inside the transaction must not make a failure partial: the
+        # spent flags and the scripts are only consistent because the whole
+        # eviction either lands or does not.
+        names = self.build_chain(3)
+        self.cap_variables(2)                     # far below one chunk
+        with mock.patch.object(DB, "_refresh_spent_flags",
+                               side_effect=sqlite3.OperationalError("boom")):
+            with self.assertRaises(sqlite3.OperationalError):
+                self.db.remove_txs(list(names))
+        self.assertEqual(self.counts(), [3, 3, 3, 3, 3], "half-evicted")
+        self.assertEqual(self.spent_flags(), {"A": 1, "B": 1, "C": 0})
+
+    def test_an_eviction_does_not_cost_a_statement_per_stale_tx(self):
+        # These txs spend nothing, so the spent-flag recompute has no work and
+        # every statement here is one of the batched ones. (An eviction whose
+        # txs do spend pays one UPDATE per output spent, which is inherent.)
+        stale = self.fill_mempool(1000)
+        seen = []
+        self.db.conn.set_trace_callback(seen.append)
+        self.db.remove_txs(stale)
+        dml = [s for s in seen if s.lstrip().upper().startswith(
+            ("SELECT", "DELETE", "INSERT", "UPDATE"))]
+        self.assertLessEqual(len(dml), 20,
+                             "%d statements for 1000 stale txs: the chunking"
+                             " is not being used" % len(dml))
+
+    def test_a_reorg_deeper_than_the_bind_cap_works(self):
+        # clear_from(0) orphans the chain, so the scoped rebuild is handed every
+        # script in it -- the same unbounded list, reached from the other side.
+        n = db_module.SQL_VAR_CHUNK * 2
+        with self.db.bulk():
+            for i in range(n):
+                self.db.add_tx(tx("T%05d" % i, i,
+                                  [("addr%d" % i, POKE, i + 1)], coinbase=True))
+        self.cap_variables(db_module.SQL_VAR_CHUNK)
+        self.db.clear_from(0)
+        self.assertEqual(self.db.query("SELECT COUNT(*) FROM blocks")[0][0], 0)
+        self.assertEqual(self.db.query("SELECT COUNT(*) FROM scripts")[0][0], 0)
+        self.assertEqual(
+            self.db.query("SELECT COUNT(*) FROM vout")[0][0], 0,
+            "vout rows for the orphaned txs are severed")
+
+    def test_a_scoped_rebuild_matches_a_full_one_past_the_cap(self):
+        hashes = [script_hash_of(script_hex(s)) for s in range(
+            db_module.SQL_VAR_CHUNK * 2)]
+        for s in range(len(hashes)):
+            self.db.add_tx(tx("T%05d" % s, 100 + s,
+                              [("addr%d" % s, POKE, s + 1)], coinbase=True))
+        self.cap_variables(db_module.SQL_VAR_CHUNK)
+        self.db.rebuild_scripts(hashes)
+        scoped = self.db.query(
+            "SELECT script_hash, type, req_sigs, addresses, created_height,"
+            " last_height FROM scripts ORDER BY script_hash")
+        self.db.rebuild_scripts()               # full table, no IN list
+        self.assertEqual(
+            scoped,
+            self.db.query("SELECT script_hash, type, req_sigs, addresses,"
+                          " created_height, last_height FROM scripts"
+                          " ORDER BY script_hash"))
+        self.assertEqual(len(scoped), len(hashes))
+
+
 class MultisigCreditTest(DBTestCase):
     """A multi-address output is credited to the script, not to participants.
 
