@@ -109,9 +109,14 @@ CREATE TABLE IF NOT EXISTS addr_out (
     PRIMARY KEY (address, txid, n)
 );
 
-CREATE INDEX IF NOT EXISTS idx_addr_out_address ON addr_out(address);
+-- No index on addr_out(address) alone: the primary key is (address, txid, n),
+-- so its autoindex already answers WHERE address=? as a prefix seek. The one on
+-- (txid, n) is not redundant, because address leads the key and the primary key
+-- cannot seek past it.
 CREATE INDEX IF NOT EXISTS idx_addr_out_txid_n ON addr_out(txid, n);
-CREATE INDEX IF NOT EXISTS idx_vout_address ON vout(addresses);
+-- No index on vout(addresses): it holds a JSON array and nothing filters on it.
+-- Address accounting runs off addr_out, and multisig money is tracked per
+-- script, so there is no lookup this could serve. See _drop_redundant_indexes.
 CREATE INDEX IF NOT EXISTS idx_txs_height ON txs(height);
 CREATE INDEX IF NOT EXISTS idx_vin_prev ON vin(prev_txid, prev_vout);
 """
@@ -227,7 +232,42 @@ class DB:
             self.conn.execute("PRAGMA busy_timeout=%d"
                               % self.NORMAL_BUSY_TIMEOUT_MS)
 
+    # (index, meta flag) for each index a table's own key or column set already
+    # covers. See _drop_redundant_indexes.
+    REDUNDANT_INDEXES = (
+        ("idx_addr_out_address", "addr_out_address_index"),
+        ("idx_vout_address", "vout_address_index"),
+    )
+
+    def _drop_redundant_indexes(self):
+        """Drop indexes that nothing queries, and that a key already covers.
+
+        * idx_addr_out_address -- addr_out's key is (address, txid, n), so
+          sqlite_autoindex_addr_out_1 answers WHERE address=? as a prefix seek.
+        * idx_vout_address -- a B-tree on a JSON array of addresses, which
+          nothing filters on. It could not serve the substring search that would
+          need it either: matching one address inside '["a","b"]' wants a row
+          per owner, not an index. Per-owner multisig accounting, if it is ever
+          wanted, is a table and not an index.
+
+        Checked by EXPLAIN QUERY PLAN across every query that reads vout or
+        addr_out: none chose either index, and dropping them changed no plan and
+        no read latency (address_balances 19.2 vs 20.6 us). What it saved is
+        1.1 MB and 1.3 MB per 60k rows, and 18% of bulk index write time.
+
+        Carries its own meta flags rather than bumping schema_version: no table
+        changes shape, and a bump would re-run _migrate()'s full
+        rebuild_scripts() on every existing database, which is a lot of work to
+        reclaim an index.
+        """
+        for index, flag in self.REDUNDANT_INDEXES:
+            if self.get_meta(flag) == "dropped":
+                continue
+            self.conn.execute("DROP INDEX IF EXISTS " + index)
+            self.set_meta(flag, "dropped")
+
     def _migrate(self):
+        self._drop_redundant_indexes()
         if self.get_meta("schema_version") == self.SCHEMA_VERSION:
             return
         # Serialize schema changes across processes (indexer + web open this

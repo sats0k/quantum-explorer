@@ -608,6 +608,69 @@ class MigrationTest(DBTestCase):
                 (real(hx),), db.query(
                     "SELECT script_hash FROM vout WHERE script_hex=?", (hx,)))
 
+    def indexes_on(self, db, table):
+        return sorted(r[0] for r in db.query(
+            "SELECT name FROM sqlite_master WHERE type='index' AND tbl_name=?",
+            (table,)))
+
+    def _demote_to_redundant_indexes(self):
+        """Recreate the database these indexes came from: both present, neither
+        meta flag set."""
+        for sql in ("CREATE INDEX idx_addr_out_address ON addr_out(address)",
+                    "CREATE INDEX idx_vout_address ON vout(addresses)"):
+            self.db.conn.execute(sql)
+        self.db.conn.execute(
+            "DELETE FROM meta WHERE key IN"
+            " ('addr_out_address_index','vout_address_index')")
+        self.db.conn.commit()
+        self.db.conn.close()
+
+    def test_neither_redundant_index_is_created(self):
+        # addr_out's key is (address, txid, n), so the address prefix is already
+        # seekable and a second index on it stores that column twice. vout's
+        # addresses is a JSON array no query filters on.
+        self.assertEqual(self.indexes_on(self.db, "addr_out"),
+                         ["idx_addr_out_txid_n", "sqlite_autoindex_addr_out_1"])
+        self.assertEqual(self.indexes_on(self.db, "vout"),
+                         ["idx_vout_script_hash", "sqlite_autoindex_vout_1"])
+
+    def test_the_primary_key_serves_the_address_lookup(self):
+        # Why the addr_out index is redundant, as a permanent check rather than a
+        # one-off EXPLAIN QUERY PLAN: address_balances() must reach the primary
+        # key's autoindex, which is what makes dropping the index safe.
+        self.db.add_tx(tx("A", 100, [("addr0", POKE, 1)], coinbase=True))
+        plans = [r[-1] for r in self.db.conn.execute(
+            "EXPLAIN QUERY PLAN SELECT SUM(a.value) FROM addr_out a"
+            " JOIN txs t ON t.txid = a.txid WHERE a.address = ?", ("addr0",))]
+        self.assertTrue(any("sqlite_autoindex_addr_out_1" in p for p in plans), plans)
+        self.assertFalse(any("idx_addr_out_address" in p for p in plans), plans)
+
+    def test_an_existing_database_loses_both_of_them(self):
+        # A fresh schema alone would not remove them: CREATE INDEX IF NOT EXISTS
+        # never drops anything, so an indexer that ran before this change keeps
+        # both indexes until something migrates it.
+        self._demote_to_redundant_indexes()
+        db = self.fresh_db(self.db_path)
+        self.assertEqual(self.indexes_on(db, "addr_out"),
+                         ["idx_addr_out_txid_n", "sqlite_autoindex_addr_out_1"])
+        self.assertEqual(self.indexes_on(db, "vout"),
+                         ["idx_vout_script_hash", "sqlite_autoindex_vout_1"])
+        for _, flag in DB.REDUNDANT_INDEXES:
+            self.assertEqual(db.get_meta(flag), "dropped")
+
+    def test_dropping_them_costs_no_scripts_rebuild(self):
+        # Why the drops are keyed on their own meta flags: schema_version drives
+        # a full rebuild_scripts(), which has no business running to reclaim
+        # indexes on an up-to-date database.
+        self.db.add_tx(tx("A", 100, [("addr0", POKE, 1)], coinbase=True))
+        self._demote_to_redundant_indexes()
+        with mock.patch.object(DB, "rebuild_scripts") as rebuild:
+            db = self.fresh_db(self.db_path)
+        rebuild.assert_not_called()
+        self.assertNotIn("idx_vout_address", self.indexes_on(db, "vout"))
+        self.assertEqual(
+            db.address_balances("addr0")["confirmed"]["n_outputs"], 1)
+
     def test_v1_counters_are_rebuilt_not_trusted(self):
         """A pre-v3 table's counters were derived data: discard, recompute."""
         self.db.add_tx(tx("A", 100, [("addr0", POKE, 1)], coinbase=True))
