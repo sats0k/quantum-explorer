@@ -747,12 +747,16 @@ class DB:
             # hands us every script in the chain and one statement cannot bind
             # that many. The chunks partition the hashes, so no script aggregates
             # in two of them and the groups concatenate into exactly the rows the
-            # single uncapped statement would have returned.
+            # single uncapped statement would have returned. Each chunk is
+            # written and dropped before the next is read, so a deep reorg never
+            # holds more than one chunk's rows in memory -- plus the seen set the
+            # deletion below needs.
             scopes = [("WHERE v.script_hash IN (%s)" % ",".join("?" * len(c)), c)
                       for c in _chunks(script_hashes)]
-        rows = []
+        need_seen = script_hashes is not None
+        seen = set() if need_seen else None
         for where, params in scopes:
-            rows += self.conn.execute(
+            rows = self.conn.execute(
                 """SELECT v.script_hash, MAX(v.type), MAX(v.req_sigs),
                           MAX(v.addresses),
                           MIN(t.height), MAX(t.height)
@@ -760,18 +764,19 @@ class DB:
                    JOIN txs t ON t.txid = v.txid
                    %s
                    GROUP BY v.script_hash""" % where, params).fetchall()
-        self.conn.executemany(
-            """INSERT OR REPLACE INTO scripts
-               (script_hash, type, req_sigs, addresses,
-                created_height, last_height)
-               VALUES (?,?,?,?,?,?)""", rows)
+            if need_seen:
+                seen.update(r[0] for r in rows)
+            self.conn.executemany(
+                """INSERT OR REPLACE INTO scripts
+                   (script_hash, type, req_sigs, addresses,
+                    created_height, last_height)
+                   VALUES (?,?,?,?,?,?)""", rows)
         if script_hashes is not None:
             # A script whose every output was severed has nothing left to
             # describe, so it leaves the table -- the same thing the full
             # rebuild's DELETE would have done to it. Batched like everything
             # else here: one DELETE per hash made an eviction cost a statement
             # per stale tx, which is the cost the chunking is here to remove.
-            seen = {r[0] for r in rows}
             gone = [h for h in script_hashes if h not in seen]
             for chunk in _chunks(gone):
                 self.conn.execute(
