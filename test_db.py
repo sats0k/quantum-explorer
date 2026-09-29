@@ -9,6 +9,8 @@ every permutation rather than one hand-picked sequence.
 
 import contextlib
 import itertools
+import json
+import queue
 import random
 import os
 import shutil
@@ -818,6 +820,64 @@ class ConnectionSetupTest(DBTestCase):
         for t in threads:
             t.join()
         self.assertEqual(found, [POKE] * 8)
+
+
+class PoolTimeoutTest(DBTestCase):
+    """An exhausted pool must answer 503, not strand request threads forever.
+    And the response must be written after the connection is given back, so a
+    slow client cannot pin a connection that another request is waiting on.
+    """
+
+    def _serve(self, pool, timeout):
+        """Serve the real Handler over HTTP while `pool` stays the class pool."""
+        import http.server
+        server_module.Handler.pool = pool
+        httpd = http.server.ThreadingHTTPServer(("127.0.0.1", 0),
+                                                server_module.Handler)
+        port = httpd.server_address[1]
+        threading.Thread(target=httpd.serve_forever, daemon=True).start()
+        self.addCleanup(httpd.server_close)
+        self.addCleanup(httpd.shutdown)
+        return mock.patch.object(server_module, "POOL_TIMEOUT", timeout), port
+
+    def test_borrow_times_out_when_every_connection_is_on_loan(self):
+        pool = DBPool(self.db_path, size=1)
+        self.addCleanup(pool.close)
+        with pool.borrow():                        # the only connection is taken
+            with self.assertRaises(queue.Empty):
+                with pool.borrow(timeout=0.05):
+                    pass
+
+    def test_the_api_answers_503_when_the_pool_is_exhausted(self):
+        import urllib.request
+        pool = DBPool(self.db_path, size=1)
+        self.addCleanup(pool.close)
+        with pool.borrow():
+            patcher, port = self._serve(pool, 0.1)
+            with patcher, self.assertRaises(urllib.error.HTTPError) as cm:
+                urllib.request.urlopen(
+                    "http://127.0.0.1:%d/api/summary" % port, timeout=5)
+            self.assertEqual(cm.exception.code, 503)
+            self.assertEqual(json.loads(cm.exception.read()),
+                             {"error": "busy"})
+
+    def test_the_api_still_answers_200_after_the_restructure(self):
+        # The borrow now returns the handle to the pool before the response is
+        # written; a normal request must still produce its response body.
+        import urllib.request
+        pool = DBPool(self.db_path, size=1)
+        self.addCleanup(pool.close)
+        with self.db.bulk():
+            self.db.add_block(Block({"height": 0, "hash": "b0000", "tx": [],
+                                     "previousblockhash": None}))
+        patcher, port = self._serve(pool, 5)
+        with patcher:
+            body = urllib.request.urlopen(
+                "http://127.0.0.1:%d/api/summary" % port,
+                timeout=5).read()
+        out = json.loads(body)
+        self.assertEqual(out["tip"]["height"], 0)
+        self.assertIn("n_blocks", out)
 
 
 class BusyTimeoutTest(DBTestCase):

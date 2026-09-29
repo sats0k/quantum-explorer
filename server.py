@@ -92,6 +92,13 @@ def with_hex(balances):
     return balances
 
 
+# How long a request waits for a pool connection before answering 503. The
+# pool is small and queries are short, so this only trips when several slow
+# queries are in flight at once -- and an indefinite wait there is strictly
+# worse than a bounded one.
+POOL_TIMEOUT = 5.0
+
+
 class DBPool:
     """A fixed set of read connections, handed out to request threads.
 
@@ -108,6 +115,9 @@ class DBPool:
     A borrow must not nest: a handler that needed two connections at once would
     wait for itself once the pool is empty. Nothing here does, and the
     background coinbase thread keeps its own connection for the same reason.
+
+    borrow(timeout=...) passes to the FreeLifoQueue's get: the API hands out
+    503 once the pool stays exhausted, instead of a thread waiting forever.
     """
 
     def __init__(self, path, size=4):
@@ -117,8 +127,10 @@ class DBPool:
             self._free.put(db)
 
     @contextlib.contextmanager
-    def borrow(self):
-        db = self._free.get()
+    def borrow(self, timeout=None):
+        # timeout=None keeps the historical indefinite wait for callers that
+        # want it; queue.Empty propagates to the caller with timeout set.
+        db = self._free.get(timeout=timeout)
         try:
             yield db
         finally:
@@ -403,30 +415,42 @@ class Handler(BaseHTTPRequestHandler):
             self._send_404()
             return
         try:
-            with self.pool.borrow() as db:
+            # The borrow only spans the querying. The response body is written
+            # after the connection is returned, so a slow client doggedly
+            # draining the socket cannot hold a connection that another
+            # request is waiting on -- only concurrent *queries* share the
+            # pool, never *writes*.
+            with self.pool.borrow(timeout=POOL_TIMEOUT) as db:
                 exp = Explorer(db)
                 if len(parts) == 1 or parts[1] == "summary":
-                    self._send(200, exp.summary())
+                    res = 200, exp.summary()
                 elif parts[1] == "mempool":
-                    self._send(200, exp.mempool())
+                    res = 200, exp.mempool()
                 elif parts[1] == "recent_blocks":
-                    self._send(200, exp.recent_blocks())
+                    res = 200, exp.recent_blocks()
                 elif parts[1] == "block" and len(parts) == 3:
                     b = exp.block(parts[2])
-                    self._send(200, b) if b else self._send_404()
+                    res = (200, b) if b else (404, {"error": "not found"})
                 elif parts[1] == "tx" and len(parts) == 3:
                     t = exp.tx(parts[2])
-                    self._send(200, t) if t else self._send_404()
+                    res = (200, t) if t else (404, {"error": "not found"})
                 elif parts[1] == "address" and len(parts) == 3:
                     a = exp.address(parts[2])
-                    self._send(200, a) if a else self._send_404()
+                    res = (200, a) if a else (404, {"error": "not found"})
                 elif parts[1] == "script" and len(parts) == 3:
                     s = exp.script(parts[2])
-                    self._send(200, s) if s else self._send_404()
+                    res = (200, s) if s else (404, {"error": "not found"})
                 else:
-                    self._send_404()
+                    res = 404, {"error": "not found"}
+        except queue.Empty:
+            # Every connection is on loan and none came free in time -- four
+            # simultaneous long queries. Say so instead of waiting forever.
+            self._send(503, {"error": "busy"})
+            return
         except sqlite3.Error as e:
             self._send(500, {"error": str(e)})
+            return
+        self._send(*res)
 
 
 def _total_coinbase_loop(db_path, interval=5):
