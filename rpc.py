@@ -56,6 +56,10 @@ class RPC:
         a result, so one bad call doesn't discard the whole window (a batch reply
         comes back HTTP 200; only a single-call failure is HTTP 500). The error's
         code and message ride along for the caller to classify.
+
+        Reply ids are validated in either mode: a duplicated or unexpected id
+        raises RPCError, because the reply frame cannot then be trusted to line
+        up with `calls`, and mis-pairing them would silently corrupt data.
         """
         body = json.dumps([
             {"method": m, "params": list(p), "id": i}
@@ -64,13 +68,28 @@ class RPC:
         if not calls:
             return []
         replies = self._post(body, is_batch=True)
+        # A batch is answered by a list, or by a lone object when the daemon
+        # helps itself to a single response. Every reply must answer one of
+        # the calls we sent: an id we never issued, or a duplicate, means the
+        # frame cannot be trusted to line up with `calls`, and pinning it to
+        # the wrong slot would silently corrupt data. A response that is
+        # simply missing is ordinary (a failed call) and falls through to the
+        # per-slot error path, so completeness is not demanded -- only that
+        # what does arrive is coherent.
+        expected = set(range(len(calls)))
         by_id = {}
-        if isinstance(replies, list):
-            for r in replies:
-                if isinstance(r, dict) and "id" in r:
-                    by_id[r["id"]] = r
-        elif isinstance(replies, dict) and "id" in replies:
-            by_id[replies["id"]] = replies
+        if isinstance(replies, dict):
+            replies = [replies]
+        elif not isinstance(replies, list):
+            raise RPCError("batch reply is neither a list nor an object: %r"
+                           % (replies,))
+        for r in replies:
+            rid = r.get("id") if isinstance(r, dict) else None
+            if rid not in expected:
+                raise RPCError("batch reply answers no call we made: %r" % (r,))
+            if rid in by_id:
+                raise RPCError("batch reply duplicated id %r" % rid)
+            by_id[rid] = r
         out = []
         for i, c in enumerate(calls):
             r = by_id.get(i) or {}

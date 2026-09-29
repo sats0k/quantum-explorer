@@ -1893,6 +1893,81 @@ class AmountParsingTest(unittest.TestCase):
         self.assertEqual(amount_to_pokes(Decimal("0E-8")), 0)
 
 
+class RpcBatchAlignmentTest(unittest.TestCase):
+    """The real batch client, against a stub HTTP server that misbehaves.
+
+    A batch is answered by a list (or a lone object). Every reply must answer
+    one of the calls we sent; duplicated, unexpected or non-object replies mean
+    the frame cannot be trusted to line up with the calls, and must raise in
+    either mode rather than silently mis-pair results.
+    """
+
+    def serve(self, payload):
+        """Run a stub HTTP server answering every request with `payload`
+        (a JSON-encodable object) and return an RPC pointed at it."""
+
+        import http.server
+        import threading
+        from rpc import RPC
+
+        data = json.dumps(payload).encode()
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def do_POST(self):
+                self.rfile.read(int(self.headers.get("Content-Length", 0)))
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(data)))
+                self.end_headers()
+                self.wfile.write(data)
+
+            def log_message(self, *a):
+                pass
+
+        httpd = http.server.HTTPServer(("127.0.0.1", 0), Handler)
+        self.addCleanup(httpd.server_close)
+        self.addCleanup(httpd.shutdown)
+        threading.Thread(target=httpd.serve_forever, daemon=True).start()
+        return RPC(port=httpd.server_address[1])
+
+    def test_duplicate_ids_raise_in_either_mode(self):
+        rpc = self.serve([{"id": 0, "result": "a"}, {"id": 0, "result": "b"}])
+        for strict in (True, False):
+            with self.assertRaises(RPCError):
+                rpc.batch([("m", (1,)), ("m", (2,))], strict=strict)
+
+    def test_an_unexpected_id_is_rejected(self):
+        rpc = self.serve([{"id": 999, "result": "x"}])
+        with self.assertRaises(RPCError):
+            rpc.batch([("m", (1,))], strict=False)
+
+    def test_a_non_object_reply_is_rejected(self):
+        rpc = self.serve([None, {"id": 1, "result": "x"}])
+        with self.assertRaises(RPCError):
+            rpc.batch([("m", (1,)), ("m", (2,))], strict=False)
+
+    def test_a_string_id_is_rejected(self):
+        rpc = self.serve([{"id": "0", "result": "x"}])
+        with self.assertRaises(RPCError):
+            rpc.batch([("m", (1,))])
+
+    def test_reordered_ids_still_line_up_with_their_calls(self):
+        rpc = self.serve([{"id": 1, "result": "second"},
+                          {"id": 0, "result": "first"}])
+        self.assertEqual(rpc.batch([("m", (1,)), ("m", (2,))]),
+                         ["first", "second"])
+
+    def test_a_lone_object_reply_is_accepted(self):
+        rpc = self.serve({"id": 0, "result": "solo"})
+        self.assertEqual(rpc.batch([("m", (1,))]), ["solo"])
+
+    def test_a_missing_response_is_a_slot_error_not_a_crash(self):
+        rpc = self.serve([{"id": 0, "result": "only"}])
+        out = rpc.batch([("m", (1,)), ("m", (2,))], strict=False)
+        self.assertEqual(out[0], "only")
+        self.assertIsInstance(out[1], CallError)
+
+
 class RecentBlocksTest(DBTestCase):
     """recent_blocks() is one query, and agrees with block()."""
 
