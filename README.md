@@ -14,7 +14,7 @@ script parsing is reimplemented on the explorer side.
 | File              | Purpose                                        |
 | ----------------- | ---------------------------------------------- |
 | `indexer.py`      | Syncs chain + mempool from the daemon into SQLite |
-| `db.py`           | SQLite schema (`blocks`, `txs`, `vin`, `vout`, `addr_out`) |
+| `db.py`           | SQLite schema (`blocks`, `txs`, `vin`, `vout`, `addr_out`, `scripts`, `meta`) |
 | `rpc.py`          | JSON-RPC client (basic auth)                   |
 | `server.py`       | Read-only JSON API + static web UI             |
 | `explorer.sh`     | Start/stop/status wrapper for indexer + web UI |
@@ -148,7 +148,10 @@ So a client that walks a multisig participant address gets a 404 from
   ~0.06 ms for the connect itself.
 - `ThreadingHTTPServer` runs a thread per request, so a per-thread connection
   would be no better than one per request; the pool is a `LifoQueue` of
-  connections handed out one at a time. A borrow must not nest.
+  connections handed out one at a time. A borrow must not nest. A borrow times
+  out after 5 s; the handler computes its `(status, payload)` inside the borrow
+  and sends after releasing, so a request that cannot get a connection within
+  the window is answered `503 {"error": "busy"}` instead of parking the thread.
 - Run with `-rpcuser`/`-rpcpassword` in `phoenixcoin.conf` (or the process
   flags); the RPC server must be reachable on `127.0.0.1`.
 - `db.py` sets WAL mode; the indexer and web server may run concurrently
@@ -161,5 +164,6 @@ So a client that walks a multisig participant address gets a 404 from
 - The Phoenixcoin Quantum daemon has no `-txindex`, so
   `getrawtransaction` can only resolve confirmed txs that still have
   unspent outputs. A tx whose outputs are all spent (the genesis coinbase
-  is the guaranteed one) is indexed by txid alone, with no inputs/outputs;
-  the indexer logs how many it had to store that way.
+  is the guaranteed one) cannot be resolved; the indexer retries it briefly
+  (3 tries, 0.5 s backoff) to ride out transient failures, then stores it by
+  txid alone with no inputs/outputs, logging how many it had to store that way.
