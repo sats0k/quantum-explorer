@@ -1,7 +1,7 @@
 """Regression tests. Run: python3 -m unittest test_db -v
 
 The mempool-eviction cases matter because removing a chain of txs (A -> B -> C)
-leaves addr_out.is_spent describing whichever mempool the index happened to be
+leaves addr_out.spent_by describing whichever mempool the index happened to be
 holding when each delete ran. The property under test is that the final state is
 the same whatever order the removals happen in, so the ordering test sweeps
 every permutation rather than one hand-picked sequence.
@@ -138,12 +138,26 @@ def tx(txid, height, pays, spends=(), coinbase=False, owners=None, req_sigs=1):
 
 
 def full_spent_recompute(db):
-    """Ground truth for addr_out.is_spent, recomputed from vin for the whole
-    table. Any write path, whatever order it ran in, must agree with this."""
-    db.conn.execute("UPDATE addr_out SET is_spent=0")
-    db.conn.execute(
-        """UPDATE addr_out SET is_spent=1 WHERE (txid, n) IN
-           (SELECT prev_txid, prev_vout FROM vin WHERE prev_txid IS NOT NULL)""")
+    """Ground truth for the spent_by mask, recomputed from vin for the whole
+    table. Any write path, whatever order it ran in, must agree with this.
+
+    Recomputed for addr_out and vout both, and per spender status rather than
+    as a single boolean, because the mask is what the balance views read and a
+    ground truth that only pinned the live reading would let a mempool-only
+    spender through unnoticed.
+    """
+    for table in ("addr_out", "vout"):
+        db.conn.execute("UPDATE %s SET spent_by=0" % table)
+        db.conn.execute(
+            "UPDATE %s SET spent_by = (CASE WHEN EXISTS ("
+            "  SELECT 1 FROM vin JOIN txs ON txs.txid = vin.txid"
+            "  WHERE vin.prev_txid = %s.txid AND vin.prev_vout = %s.n"
+            "    AND txs.status = 'confirmed') THEN 1 ELSE 0 END)"
+            " | (CASE WHEN EXISTS ("
+            "  SELECT 1 FROM vin JOIN txs ON txs.txid = vin.txid"
+            "  WHERE vin.prev_txid = %s.txid AND vin.prev_vout = %s.n"
+            "    AND txs.status = 'mempool') THEN 2 ELSE 0 END)"
+            % (table, table, table, table, table))
 
 
 class DBTestCase(unittest.TestCase):
@@ -167,14 +181,34 @@ class DBTestCase(unittest.TestCase):
         self.addCleanup(db.conn.close)
         return db
 
-    def is_spent(self, txid, n=0):
-        """is_spent of an output, or None when the output is gone."""
+    def spent_by(self, txid, n=0):
+        """The spent_by mask of an output, or None when the output is gone.
+
+        The raw mask, not a boolean: the tests below assert on the bit that
+        distinguishes a mempool spender from a confirmed one, which is the
+        distinction the two balance views turn on.
+        """
         rows = self.db.query(
-            "SELECT is_spent FROM addr_out WHERE txid=? AND n=?", (txid, n))
-        return None if not rows else bool(rows[0][0])
+            "SELECT spent_by FROM addr_out WHERE txid=? AND n=?", (txid, n))
+        return None if not rows else rows[0][0]
+
+    def is_spent(self, txid, n=0):
+        """Whether any known tx spends an output, or None when it is gone.
+
+        The live reading, which is what this name always meant here: bit 0 of
+        the mask, set by either a confirmed or a mempool spender.
+        """
+        mask = self.spent_by(txid, n)
+        return None if mask is None else bool(mask & 3)
+
+    def vout_spent_by(self, txid, n=0):
+        """The same mask on vout, which the script balances read instead."""
+        rows = self.db.query(
+            "SELECT spent_by FROM vout WHERE txid=? AND n=?", (txid, n))
+        return None if not rows else rows[0][0]
 
     def spent_flags(self):
-        return dict(self.db.query("SELECT txid, is_spent FROM addr_out"))
+        return dict(self.db.query("SELECT txid, spent_by FROM addr_out"))
 
     def rows_for(self, table, txid):
         return self.db.query(
@@ -237,7 +271,7 @@ class MempoolEvictionTest(DBTestCase):
                                  spends=[("ABC"[i], 0)]))
                 db.remove_txs(order)
                 self.assertEqual(
-                    dict(db.query("SELECT txid, is_spent FROM addr_out")),
+                    dict(db.query("SELECT txid, spent_by FROM addr_out")),
                     {"A": 0})
 
     def test_shared_output_with_two_spenders(self):
@@ -353,7 +387,11 @@ class VariableLimitTest(DBTestCase):
             with self.assertRaises(sqlite3.OperationalError):
                 self.db.remove_txs(list(names))
         self.assertEqual(self.counts(), [3, 3, 3, 3, 3], "half-evicted")
-        self.assertEqual(self.spent_flags(), {"A": 1, "B": 1, "C": 0})
+        # Bit 2, not bit 1: the chain is all mempool, so A and B are spent by an
+        # unconfirmed tx and are live-spent but confirmed-unspent. The rollback
+        # is what is under test; the mask values say the flags were not left
+        # half-written by the interrupted refresh.
+        self.assertEqual(self.spent_flags(), {"A": 2, "B": 2, "C": 0})
 
     def test_an_eviction_does_not_cost_a_statement_per_stale_tx(self):
         # These txs spend nothing, so the spent-flag recompute has no work and
@@ -602,6 +640,300 @@ class ScriptBalanceTest(DBTestCase):
         self.assertFalse(self.explorer.address("addr0")["outputs"][0]["spent"])
 
 
+class SpentMaskTest(DBTestCase):
+    """The spent_by mask, and the balances that are read from it.
+
+    spent_by replaced a boolean because the two balance views disagree about
+    the *spender* as well as the owner: an output spent only by a mempool tx is
+    confirmed-unspent, since a mempool spend can still evaporate. So the mask
+    is what a boolean could not express, and these tests pin each of its four
+    values plus the balances they produce.
+    """
+
+    def add_receiver(self, txid="A", height=100):
+        self.db.add_tx(tx(txid, height, [("addr0", POKE, 1)], coinbase=True))
+
+    def add_spender(self, txid, spends=("A", 0), height=None):
+        self.db.add_tx(tx(txid, height, [("addr1", POKE // 2, 2)],
+                          spends=[spends]))
+
+    def test_each_spender_status_sets_its_own_bit(self):
+        self.add_receiver()
+        self.assertEqual(self.spent_by("A"), 0, "unspent")
+        self.add_spender("M", height=None)
+        self.assertEqual(self.spent_by("A"), 2, "mempool spender only")
+        self.add_spender("C", height=101)
+        self.assertEqual(self.spent_by("A"), 3, "both spenders")
+        self.db.remove_tx("C")
+        self.assertEqual(self.spent_by("A"), 2, "the mempool one remains")
+        self.db.remove_tx("M")
+        self.assertEqual(self.spent_by("A"), 0, "no spender left")
+
+    def test_a_confirmed_spender_alone_sets_the_confirmed_bit(self):
+        self.add_receiver()
+        self.add_spender("C", height=101)
+        self.assertEqual(self.spent_by("A"), 1)
+
+    def test_the_mask_is_kept_on_vout_as_well(self):
+        # vout is the only place a multisig's answer exists, so a mask on
+        # addr_out alone would leave script_balances re-deriving the fact.
+        self.add_receiver()
+        self.add_spender("C", height=101)
+        self.assertEqual(self.vout_spent_by("A"), 1)
+        self.assertEqual(self.vout_spent_by("A"), self.spent_by("A"))
+
+    def test_the_owner_bit_is_set_while_unconfirmed_and_cleared_on_confirm(self):
+        # The bit is written once at insert, because an orphan's rows are
+        # deleted rather than flagged -- so a row's owner cannot go from
+        # mempool to confirmed without the row being rebuilt.
+        self.add_receiver("M", height=None)
+        self.assertEqual(
+            self.db.query("SELECT mempool FROM addr_out WHERE txid='M'")[0][0], 1)
+        self.add_receiver("M", height=100)          # same txid, now in a block
+        self.assertEqual(
+            self.db.query("SELECT mempool FROM addr_out WHERE txid='M'")[0][0], 0)
+
+    def test_the_masks_survive_a_reorg(self):
+        self.add_receiver("A", 100)
+        self.add_spender("B", height=101)
+        self.assertEqual(self.spent_by("A"), 1)
+        self.db.clear_from(101)                    # drops B, orphaning nothing
+        self.assertEqual(self.spent_by("A"), 0, "the only spencer was orphaned")
+
+
+class BalanceParityTest(DBTestCase):
+    """The new balance queries must agree with the SQL they replaced.
+
+    The old implementation joined txs for the owner and ran a correlated EXISTS
+    into vin for the spender, per output, per request -- 41s for the busiest
+    address. It is kept here verbatim as ground truth, so the denormalized
+    columns are checked against the derivation they exist to avoid rather than
+    against hand-written expectations that would agree with a wrong mask too.
+    """
+
+    def legacy_balances(self, table, key_col, key, count_col):
+        """The pre-mask implementation, unchanged, as the oracle."""
+        out = {}
+        for name, status in (("confirmed", "('confirmed')"),
+                             ("live", "('confirmed','mempool')")):
+            received, n = self.db.conn.execute(
+                "SELECT COALESCE(SUM(v.value),0), COUNT(*) FROM %s v "
+                "JOIN txs t ON t.txid = v.txid "
+                "WHERE v.%s=? AND t.status IN %s" % (table, key_col, status),
+                (key,)).fetchone()
+            spent, n_spent = self.db.conn.execute(
+                "SELECT COALESCE(SUM(v.value),0), COUNT(*) FROM %s v "
+                "JOIN txs t ON t.txid = v.txid "
+                "WHERE v.%s=? AND t.status IN %s "
+                "AND EXISTS (SELECT 1 FROM vin i JOIN txs ti ON ti.txid=i.txid "
+                "WHERE i.prev_txid=v.txid AND i.prev_vout=v.n "
+                "AND ti.status IN %s)" % (table, key_col, status, status),
+                (key,)).fetchone()
+            out[name] = {"value_received": received, count_col: n,
+                         "value_spent": spent, "n_spent": n_spent,
+                         "balance": received - spent}
+        return out
+
+    def build_mixed_chain(self):
+        """Every combination the two views disagree about, in one chain.
+
+        A confirmed output spent by nothing, by a confirmed tx, by a mempool tx
+        and by both; a mempool output spent by a confirmed tx and by a mempool
+        one; and an unconfirmed output of each, which is what the owner bit
+        exists to separate.
+        """
+        self.db.add_tx(tx("C1", 100, [("a", POKE, 1)], coinbase=True))
+        self.db.add_tx(tx("C2", 100, [("a", POKE, 1)], coinbase=True))
+        self.db.add_tx(tx("C3", 100, [("a", POKE, 1)], coinbase=True))
+        self.db.add_tx(tx("C4", 100, [("a", POKE, 1)], coinbase=True))
+        self.db.add_tx(tx("M1", None, [("a", POKE, 1)], coinbase=True))
+        self.db.add_tx(tx("M2", None, [("a", POKE, 1)], coinbase=True))
+        # C1 spent by a confirmed tx only.
+        self.db.add_tx(tx("S1", 101, [("z", POKE, 9)], spends=[("C1", 0)]))
+        # C2 spent by a mempool tx only: live-spent, confirmed-unspent.
+        self.db.add_tx(tx("S2", None, [("z", POKE, 9)], spends=[("C2", 0)]))
+        # C3 spent by both.
+        self.db.add_tx(tx("S3", 101, [("z", POKE, 9)], spends=[("C3", 0)]))
+        self.db.add_tx(tx("S4", None, [("z", POKE, 9)], spends=[("C3", 0)]))
+        # C4 and M2 unspent.
+        # A confirmed tx spending a mempool output: the output is not received
+        # in the confirmed view, so it must not be spent in it either.
+        self.db.add_tx(tx("S5", 102, [("z", POKE, 9)], spends=[("M1", 0)]))
+        # A mempool tx spending a mempool output.
+        self.db.add_tx(tx("S6", None, [("z", POKE, 9)], spends=[("M2", 0)]))
+
+    def test_address_balances_match_the_legacy_queries(self):
+        self.build_mixed_chain()
+        self.assertEqual(
+            self.db.address_balances("a"),
+            self.legacy_balances("addr_out", "address", "a", "n_outputs"))
+
+    def test_script_balances_match_the_legacy_queries(self):
+        self.build_mixed_chain()
+        sh = script_hash_of(script_hex(1))
+        self.assertEqual(
+            self.db.script_balances(sh),
+            self.legacy_balances("vout", "script_hash", sh, "n_vout"))
+
+    def test_the_views_really_do_differ(self):
+        # Guards the parity tests above from passing vacuously: if the two views
+        # had collapsed into one, they would agree with each other and with the
+        # legacy SQL no matter what the mask said.
+        self.build_mixed_chain()
+        bal = self.db.address_balances("a")
+        self.assertNotEqual(bal["confirmed"], bal["live"])
+        self.assertEqual(bal["confirmed"]["value_spent"], 2 * POKE,
+                         "C1 and C3, not C2 (mempool-only spender)")
+        self.assertEqual(bal["live"]["value_spent"], 5 * POKE,
+                         "C1, C2, C3, M1 and M2")
+        self.assertEqual(bal["confirmed"]["value_received"], 4 * POKE)
+        self.assertEqual(bal["live"]["value_received"], 6 * POKE)
+
+    def test_a_reorg_returns_both_views_to_the_legacy_answers(self):
+        self.build_mixed_chain()
+        self.db.clear_from(102)
+        self.assertEqual(
+            self.db.address_balances("a"),
+            self.legacy_balances("addr_out", "address", "a", "n_outputs"))
+
+
+class SpentMaskMigrationTest(DBTestCase):
+    """The spent_by backfill, on a database that predates the columns.
+
+    The migration is the one place this feature can be wrong in a way no later
+    write will fix: the columns are added defaulted to 0, and 0 means "unspent".
+    A partial backfill would therefore read as every output being unspent and
+    report a balance of the entire supply -- a wrong number rather than an
+    error. So it is exercised here from a genuinely pre-mask schema, on both of
+    its backfill paths, and checked against the derivation it replaced.
+    """
+
+    def _demote_to_pre_mask(self, with_mempool=False):
+        """Rebuild addr_out and vout as they were before the columns existed.
+
+        The old shape is recreated by hand rather than by downgrading the
+        schema, because SQLite cannot remove a column that a covering index
+        depends on -- so the indexes go first, and the is_spent column is
+        restored with the value the fast backfill path reads.
+        """
+        with_mempool = with_mempool
+        for tag, height, spends in (("C1", 100, []), ("C2", 100, [])):
+            self.db.add_tx(tx(tag, height, [("a", POKE, 1)], coinbase=True))
+        self.db.add_tx(tx("S1", 101, [("z", POKE, 9)], spends=[("C1", 0)]))
+        if with_mempool:
+            self.db.add_tx(tx("M1", None, [("a", POKE, 1)], coinbase=True))
+            self.db.add_tx(tx("S2", None, [("z", POKE, 9)], spends=[("C2", 0)]))
+            self.db.add_tx(tx("S3", None, [("z", POKE, 9)], spends=[("C1", 0)]))
+        self.db.conn.execute("DROP INDEX IF EXISTS idx_addr_out_addr")
+        self.db.conn.execute("DROP INDEX IF EXISTS idx_vout_script")
+        for table in ("addr_out", "vout"):
+            self.conn_alter(table, "DROP COLUMN mempool")
+            self.conn_alter(table, "DROP COLUMN spent_by")
+        self.conn_alter("addr_out", "ADD COLUMN is_spent INTEGER DEFAULT 0")
+        # is_spent is the live reading, which is all the no-mempool fast path
+        # needs; a database that also has mempool spenders takes the other path.
+        self.db.conn.execute(
+            "UPDATE addr_out SET is_spent = EXISTS ("
+            "  SELECT 1 FROM vin WHERE vin.prev_txid = addr_out.txid"
+            "    AND vin.prev_vout = addr_out.n)")
+        self.db.conn.execute("DELETE FROM meta WHERE key = 'spent_mask'")
+        self.db.conn.commit()
+        self.db.conn.close()
+        # Deliberately does NOT reopen: the caller decides when to migrate, so
+        # a test can watch the migration fail rather than finding it already
+        # applied.
+
+    def conn_alter(self, table, clause):
+        self.db.conn.execute("ALTER TABLE %s %s" % (table, clause))
+
+    def masks(self, db):
+        return dict(db.query("SELECT txid, spent_by FROM addr_out"))
+
+    def vout_masks(self, db):
+        return dict(db.query("SELECT txid, spent_by FROM vout"))
+
+    def legacy(self, db, key="a"):
+        """The pre-mask balances, as the oracle for the migrated database."""
+        out = {}
+        for name, status in (("confirmed", "('confirmed')"),
+                             ("live", "('confirmed','mempool')")):
+            received, n = db.conn.execute(
+                "SELECT COALESCE(SUM(a.value),0), COUNT(*) FROM addr_out a "
+                "JOIN txs t ON t.txid = a.txid "
+                "WHERE a.address=? AND t.status IN %s" % status, (key,)).fetchone()
+            spent, n_spent = db.conn.execute(
+                "SELECT COALESCE(SUM(a.value),0), COUNT(*) FROM addr_out a "
+                "JOIN txs t ON t.txid = a.txid "
+                "WHERE a.address=? AND t.status IN %s AND EXISTS ("
+                "  SELECT 1 FROM vin i JOIN txs ti ON ti.txid=i.txid"
+                "  WHERE i.prev_txid=a.txid AND i.prev_vout=a.n"
+                "    AND ti.status IN %s)" % (status, status), (key,)).fetchone()
+            out[name] = {"value_received": received, "n_outputs": n,
+                         "value_spent": spent, "n_spent": n_spent,
+                         "balance": received - spent}
+        return out
+
+    def test_the_backfill_sets_the_masks_with_no_mempool(self):
+        self._demote_to_pre_mask(with_mempool=False)
+        db = self.fresh_db(self.db_path)
+        # C1 is spent by a confirmed tx, C2 by nothing. S1 pays to "z" and has
+        # rows of its own, unspent. vout is checked too, since it is the table
+        # the old is_spent shortcut did not cover.
+        self.assertEqual(self.masks(db), {"C1": 1, "C2": 0, "S1": 0})
+        self.assertEqual(self.vout_masks(db), {"C1": 1, "C2": 0, "S1": 0})
+        self.assertEqual(db.address_balances("a"), self.legacy(db))
+
+    def test_the_backfill_separates_the_spender_statuses(self):
+        # C1 has a confirmed AND a mempool spenter, C2 only a mempool one, M1 is
+        # a mempool output. Confirmed and live now genuinely differ, so a
+        # backfill that collapsed them into the old single boolean would be
+        # caught here and nowhere else.
+        self._demote_to_pre_mask(with_mempool=True)
+        db = self.fresh_db(self.db_path)
+        self.assertEqual(self.masks(db),
+                         {"C1": 3, "C2": 2, "M1": 0, "S1": 0, "S2": 0, "S3": 0})
+        self.assertEqual(self.vout_masks(db),
+                         {"C1": 3, "C2": 2, "M1": 0, "S1": 0, "S2": 0, "S3": 0})
+        self.assertEqual(db.address_balances("a"), self.legacy(db))
+        self.assertNotEqual(db.address_balances("a")["confirmed"],
+                            db.address_balances("a")["live"])
+
+    def test_the_migration_is_idempotent_and_runs_once(self):
+        self._demote_to_pre_mask()
+        db = self.fresh_db(self.db_path)
+        before = self.masks(db)
+        db.conn.close()
+        again = self.fresh_db(self.db_path)
+        self.assertEqual(self.masks(again), before, "re-seeding changed nothing")
+        self.assertEqual(again.get_meta("spent_mask"), "1")
+
+    def test_a_failed_backfill_leaves_no_half_migrated_schema(self):
+        # The flag is set on the way out, so a failure partway leaves a database
+        # the next start retries from the top -- rather than one whose columns
+        # exist and are all zero, which would read as nothing spent anywhere and
+        # report every balance as the full supply. Failing at the flag write is
+        # the worst case for this: the columns, the backfill, the dropped
+        # is_spent and the new indexes are all done by then, so all of it has to
+        # come back out.
+        self._demote_to_pre_mask()
+        real = DB.set_meta
+
+        def boom(self, key, value):
+            if key == "spent_mask":
+                raise sqlite3.OperationalError("boom")
+            return real(self, key, value)
+
+        with mock.patch.object(DB, "set_meta", boom):
+            with self.assertRaises(sqlite3.OperationalError):
+                DB(self.db_path)
+        db = self.fresh_db(self.db_path)
+        self.assertEqual(self.masks(db), {"C1": 1, "C2": 0, "S1": 0})
+        self.assertIn("idx_addr_out_addr", [
+            r[0] for r in db.conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='index'"
+                " AND tbl_name='addr_out'")])
+
+
 class MigrationTest(DBTestCase):
     def _demote_to_v2(self, n_txs=3):
         """Put the DB back before the vout.script_hash backfill: no such column,
@@ -670,20 +1002,39 @@ class MigrationTest(DBTestCase):
         # seekable and a second index on it stores that column twice. vout's
         # addresses is a JSON array no query filters on.
         self.assertEqual(self.indexes_on(self.db, "addr_out"),
-                         ["idx_addr_out_txid_n", "sqlite_autoindex_addr_out_1"])
+                         ["idx_addr_out_addr", "idx_addr_out_txid_n",
+                          "sqlite_autoindex_addr_out_1"])
+        # idx_vout_script supersedes idx_vout_script_hash: it leads with the same
+        # column, so it answers everything the plain one did and the balance
+        # query besides, and keeping both would double the write cost of every
+        # output for no plan that the covering one cannot serve.
         self.assertEqual(self.indexes_on(self.db, "vout"),
-                         ["idx_vout_script_hash", "sqlite_autoindex_vout_1"])
+                         ["idx_vout_script", "sqlite_autoindex_vout_1"])
 
-    def test_the_primary_key_serves_the_address_lookup(self):
-        # Why the addr_out index is redundant, as a permanent check rather than a
-        # one-off EXPLAIN QUERY PLAN: address_balances() must reach the primary
-        # key's autoindex, which is what makes dropping the index safe.
+    def test_the_balance_lookup_is_served_by_the_covering_index(self):
+        # Why the covering index leads with value and not just address: the
+        # balance query sums value over every output of one address, and without
+        # value in the index each of those rows costs a lookup into the table to
+        # fetch it. Checked as a permanent property rather than a one-off plan,
+        # because the whole point of the index is the "COVERING" in the plan
+        # line -- a plain address index would be a seek, and a seek is what this
+        # replaced.
         self.db.add_tx(tx("A", 100, [("addr0", POKE, 1)], coinbase=True))
         plans = [r[-1] for r in self.db.conn.execute(
-            "EXPLAIN QUERY PLAN SELECT SUM(a.value) FROM addr_out a"
-            " JOIN txs t ON t.txid = a.txid WHERE a.address = ?", ("addr0",))]
-        self.assertTrue(any("sqlite_autoindex_addr_out_1" in p for p in plans), plans)
+            "EXPLAIN QUERY PLAN SELECT COALESCE(SUM(value),0) FROM addr_out"
+            " WHERE address = ?", ("addr0",))]
+        self.assertTrue(any("COVERING INDEX idx_addr_out_addr" in p
+                            for p in plans), plans)
         self.assertFalse(any("idx_addr_out_address" in p for p in plans), plans)
+        # Same for the script side, and for the spent half, which used to be the
+        # expensive one: it must not mention vin or txs at all now.
+        spent_plans = [r[-1] for r in self.db.conn.execute(
+            "EXPLAIN QUERY PLAN SELECT COALESCE(SUM(value),0) FROM addr_out"
+            " WHERE address = ? AND (spent_by & 1)", ("addr0",))]
+        self.assertTrue(any("COVERING INDEX idx_addr_out_addr" in p
+                            for p in spent_plans), spent_plans)
+        self.assertFalse(any(" txs" in p or " vin" in p for p in spent_plans),
+                         spent_plans)
 
     def test_an_existing_database_loses_both_of_them(self):
         # A fresh schema alone would not remove them: CREATE INDEX IF NOT EXISTS
@@ -692,9 +1043,10 @@ class MigrationTest(DBTestCase):
         self._demote_to_redundant_indexes()
         db = self.fresh_db(self.db_path)
         self.assertEqual(self.indexes_on(db, "addr_out"),
-                         ["idx_addr_out_txid_n", "sqlite_autoindex_addr_out_1"])
+                         ["idx_addr_out_addr", "idx_addr_out_txid_n",
+                          "sqlite_autoindex_addr_out_1"])
         self.assertEqual(self.indexes_on(db, "vout"),
-                         ["idx_vout_script_hash", "sqlite_autoindex_vout_1"])
+                         ["idx_vout_script", "sqlite_autoindex_vout_1"])
         for _, flag in DB.REDUNDANT_INDEXES:
             self.assertEqual(db.get_meta(flag), "dropped")
 
@@ -1066,7 +1418,7 @@ class ReorgSpentFlagTest(DBTestCase):
     """Retracting only the freed outputs must equal a full recompute."""
 
     def spent_flags(self):
-        return dict(self.db.query("SELECT txid, is_spent FROM addr_out"))
+        return dict(self.db.query("SELECT txid, spent_by FROM addr_out"))
 
     def full_recompute(self):
         """The pre-existing whole-table version, for comparison."""
@@ -1203,7 +1555,7 @@ class OrphanTxHistoryTest(DBTestCase):
 
 
 class AddOrderSpentFlagTest(DBTestCase):
-    """is_spent must follow the vin table, not the order txs were added in.
+    """spent_by must follow the vin table, not the order txs were added in.
 
     Nothing promises an order: getrawmempool hands txs back as it likes, and a
     parent is re-indexed when it confirms while a child spending it may still be
@@ -1265,10 +1617,15 @@ class AddOrderSpentFlagTest(DBTestCase):
                 db = self.fresh_db()
                 for t in order:
                     db.add_tx(t)
-                scoped = dict(db.query("SELECT txid, is_spent FROM addr_out"))
+                scoped = dict(db.query("SELECT txid, spent_by FROM addr_out"))
                 full_spent_recompute(db)
-                self.assertEqual(scoped, dict(db.query("SELECT txid, is_spent FROM addr_out")))
-                self.assertEqual(scoped["P"], 1, "two spenders, one flag")
+                self.assertEqual(scoped, dict(db.query("SELECT txid, spent_by FROM addr_out")))
+                # Two spenders, one bit -- and it is bit 2, not bit 1: both
+                # children are unconfirmed, so the output is live-spent but
+                # still confirmed-unspent. Collapsing that distinction is
+                # exactly what the mask exists to prevent, so the ordering test
+                # pins the value rather than just its truthiness.
+                self.assertEqual(scoped["P"], 2, "two mempool spenders, one bit")
 
     def test_a_reindex_that_drops_an_input_releases_the_output(self):
         # Unreachable while a txid pins its own content, so the release is
@@ -1299,10 +1656,10 @@ class AddOrderSpentFlagTest(DBTestCase):
         n = db_module.SQL_VAR_CHUNK * 2
         spenders = self.spend_fan(n)
         self.db.remove_txs(spenders[:int(n * 0.6)])     # 600 pairs, 3 chunks
-        scoped = dict(self.db.query("SELECT txid, is_spent FROM addr_out"))
+        scoped = dict(self.db.query("SELECT txid, spent_by FROM addr_out"))
         full_spent_recompute(self.db)
         self.assertEqual(
-            scoped, dict(self.db.query("SELECT txid, is_spent FROM addr_out")))
+            scoped, dict(self.db.query("SELECT txid, spent_by FROM addr_out")))
         self.assertEqual(sum(1 for v in scoped.values() if v),
                          n - int(n * 0.6), "the survivors are still spent")
 
@@ -1313,7 +1670,7 @@ class AddOrderSpentFlagTest(DBTestCase):
         self.db.conn.set_trace_callback(seen.append)
         self.db.remove_txs(spenders)
         self.assertEqual(self.db.query("SELECT COUNT(*) FROM addr_out"
-                                       " WHERE is_spent=1")[0][0], 0)
+                                       " WHERE spent_by != 0")[0][0], 0)
         ups = [s for s in seen if "UPDATE addr_out" in s]
         self.assertLessEqual(
             len(ups), n // (db_module.SQL_VAR_CHUNK // 2) + 1,

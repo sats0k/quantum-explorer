@@ -87,6 +87,25 @@ CREATE TABLE IF NOT EXISTS vin (
     PRIMARY KEY (txid, n)
 );
 
+-- `mempool` and `spent_by` are denormalized facts about a row, not accounting.
+-- Both are the answer to a question the balance queries used to re-derive per
+-- output, which is what made a busy address take 41s (see _migrate_spent_mask).
+--
+-- `mempool` is 1 while the owning tx is unconfirmed. It is set from the
+-- inserting tx's height and never revisited: orphaned rows are DELETED rather
+-- than flagged (see _clear_from), so "not confirmed" only ever means mempool,
+-- and a row's owner cannot change status without the row being rewritten.
+-- Which means the owner-side status join the balance queries used to do is
+-- answerable from this bit.
+--
+-- `spent_by` is a bitmask over the spender's status, and it is what replaces
+-- the per-output EXISTS that dominated both lookups:
+--     0 = unspent, 1 = spent by a confirmed tx, 2 = by a mempool tx,
+--     3 = by both.  So `spent_by & 1` is "a confirmed tx spends this" and
+-- `spent_by & 3` is "any known tx spends this" (the old is_spent column).
+-- Two bits rather than one because the two balance views disagree about the
+-- spender as well as the owner: an output spent only by a mempool tx is
+-- confirmed-unspent, because a mempool spend can still evaporate.
 CREATE TABLE IF NOT EXISTS vout (
     txid       TEXT,
     n          INTEGER,
@@ -96,6 +115,9 @@ CREATE TABLE IF NOT EXISTS vout (
     req_sigs   INTEGER,
     script_asm TEXT,
     script_hex TEXT,
+    script_hash TEXT,
+    mempool    INTEGER NOT NULL DEFAULT 0,
+    spent_by   INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (txid, n)
 );
 
@@ -105,14 +127,33 @@ CREATE TABLE IF NOT EXISTS addr_out (
     n       INTEGER,
     value   INTEGER,
     type    TEXT,
-    is_spent INTEGER DEFAULT 0,   -- 1 once spent by a later input
+    mempool  INTEGER NOT NULL DEFAULT 0,
+    spent_by INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (address, txid, n)
 );
 
+-- Covering indexes for the two balance lookups are created by
+-- _migrate_spent_mask, not here. `value` is the reason they lead with it: the
+-- balance queries sum value over every output of one address/script, and
+-- without it in the index each of those rows costs a separate lookup into the
+-- table to fetch it -- 3.7s for the 510k-output address, against 0.4us/row for
+-- a bare scan of the same rows. The trailing (txid, n) serves the address
+-- page's spender enumeration, which otherwise has to revisit each of those
+-- rows in the table.
+--
+-- One index each, not a confirmed/mempool pair: a partial index would only
+-- help the confirmed view, and with an empty mempool it would cover almost
+-- every row anyway, so it would nearly double the write cost to save a
+-- comparison on an index-only scan that is already sequential.
+--
+-- Not in SCHEMA because SCHEMA is executed before any migration, so naming a
+-- column here would fail on exactly the databases that need adding it.
+
 -- No index on addr_out(address) alone: the primary key is (address, txid, n),
--- so its autoindex already answers WHERE address=? as a prefix seek. The one on
--- (txid, n) is not redundant, because address leads the key and the primary key
--- cannot seek past it.
+-- so its autoindex already answers WHERE address=? as a prefix seek, and
+-- idx_addr_out_addr answers it covering. The one on
+-- (txid, n) is not redundant, because address leads the key and the primary
+-- key cannot seek past it.
 CREATE INDEX IF NOT EXISTS idx_addr_out_txid_n ON addr_out(txid, n);
 -- No index on vout(addresses): it holds a JSON array and nothing filters on it.
 -- Address accounting runs off addr_out, and multisig money is tracked per
@@ -346,8 +387,17 @@ class DB:
 
     def _migrate(self):
         self._drop_redundant_indexes()
-        if self.get_meta("schema_version") == self.SCHEMA_VERSION:
-            return
+        # Ordered, and both unconditional. The version migration has to come
+        # first because the spent-mask migration builds an index on
+        # vout.script_hash, which an older database does not have until the
+        # version migration adds it. Neither is skipped by the other's early
+        # return: each carries its own meta flag, so a database can be on the
+        # current version and still need the columns.
+        if self.get_meta("schema_version") != self.SCHEMA_VERSION:
+            self._migrate_version()
+        self._migrate_spent_mask()
+
+    def _migrate_version(self):
         # Serialize schema changes across processes (indexer + web open this
         # same DB): first-comer migrates under EXCLUSIVE, the rest block on
         # busy_timeout and then see schema_version set.
@@ -391,6 +441,129 @@ class DB:
             self._migrate_scripts_columns()
             self.rebuild_scripts()
             self.set_meta("schema_version", self.SCHEMA_VERSION)
+        except BaseException:
+            self.conn.rollback()
+            raise
+
+    def _migrate_spent_mask(self):
+        """Add mempool/spent_by to addr_out and vout, and backfill them once.
+
+        The balance lookups used to re-derive, per output and per request,
+        two facts the write path already knows: who owns the output, and who
+        spends it. On the busiest address that was 510k txs lookups plus 510k
+        correlated EXISTS into vin, and /api/address took 41s. Both are now
+        columns maintained by _refresh_spent_flags and by the insert, so this
+        migration is what turns the existing rows into that shape.
+
+        Carries its own meta flag rather than riding schema_version: a version
+        bump re-runs the version migration's full rebuild_scripts() -- a
+        re-aggregate over every vout in the chain -- on every existing
+        database, which is a lot of work to add two columns. Same reasoning as
+        _drop_redundant_indexes, except this one does change table shape.
+
+        Carries it in a single transaction, so a database that fails partway
+        through (an interrupted CREATE INDEX, a full disk) is left exactly as
+        it was rather than with the columns added and the values missing --
+        which would read as "every output is unspent" and report a balance of
+        the full supply. The flag is only set on the way out, so the next
+        start retries from the top.
+
+        The backfill is the expensive part: it walks every vin row to work out
+        each output's spender statuses, which is 10M rows on this chain and the
+        only step here that is not a schema edit. It happens once, and it is
+        the reason this migration wants the database to itself rather than
+        sharing it with a live web request.
+        """
+        if self.get_meta("spent_mask") == "1":
+            return
+        self.conn.execute("BEGIN EXCLUSIVE")
+        try:
+            if self.get_meta("spent_mask") == "1":
+                self.conn.commit()
+                return
+            for table in ("addr_out", "vout"):
+                cols = {r[1] for r in
+                        self.conn.execute("PRAGMA table_info(%s)" % table)}
+                if "spent_by" not in cols:
+                    # Both default to 0, which is right for mempool (there are
+                    # no mempool rows on a database being migrated after a
+                    # clean start, and the ones that do exist are fixed below)
+                    # and for spent_by only as a starting point.
+                    self.conn.execute(
+                        "ALTER TABLE %s ADD COLUMN mempool INTEGER "
+                        "NOT NULL DEFAULT 0" % table)
+                    self.conn.execute(
+                        "ALTER TABLE %s ADD COLUMN spent_by INTEGER "
+                        "NOT NULL DEFAULT 0" % table)
+            # mempool: driven from the mempool tx list rather than by scanning
+            # addr_out for rows to change. The list is bounded by the mempool
+            # and the (txid, n) indexes answer it, where the other direction --
+            # one pass over 7M rows to test each -- is the whole cost of the
+            # migration multiplied for nothing.
+            mempool = [r[0] for r in self.conn.execute(
+                "SELECT txid FROM txs WHERE status='mempool'")]
+            for txid in mempool:
+                self.conn.execute(
+                    "UPDATE addr_out SET mempool=1 WHERE txid=?", (txid,))
+                self.conn.execute(
+                    "UPDATE vout SET mempool=1 WHERE txid=?", (txid,))
+            # spent_by, derived from the spenders themselves through a temp
+            # table of (output -> status mask). Keyed on the output, so one
+            # lookup answers it, and built from vin rather than from either
+            # output table, so the unspent rows -- the majority -- cost nothing
+            # to skip.
+            #
+            # One path for both tables, and deliberately not a shortcut for
+            # addr_out's old is_spent column: that column was never on vout, so
+            # a shortcut keyed on it would leave every vout row at the default 0
+            # and every script balance reading as unspent. The vin scan is
+            # needed for vout regardless, so reading is_spent would save nothing
+            # anyway -- it was an optimisation that cost a correctness bug.
+            self.conn.execute(
+                "CREATE TEMP TABLE _sp(txid TEXT, n INTEGER, "
+                "st INTEGER, PRIMARY KEY(txid, n)) WITHOUT ROWID")
+            # Both bits, or the mask is not a mask: an output spent only by a
+            # mempool tx has to come out 2, and one spent by both has to come
+            # out 3. MAX() over a boolean is 1 if any spender has that status,
+            # so the two are independent tests and the mempool one is shifted
+            # into the high bit.
+            self.conn.execute(
+                "INSERT OR REPLACE INTO _sp "
+                "SELECT i.prev_txid, i.prev_vout, "
+                "       MAX(t.status = 'confirmed') "
+                "     | (MAX(t.status = 'mempool') << 1) "
+                "FROM vin i JOIN txs t ON t.txid = i.txid "
+                "WHERE i.prev_txid IS NOT NULL GROUP BY 1, 2")
+            for table in ("addr_out", "vout"):
+                # Restricted to the outputs _sp actually holds: everything else
+                # is unspent, which is what the column was just defaulted to, so
+                # rewriting those rows would be a full pass over the table to
+                # store a value it already has.
+                self.conn.execute(
+                    "UPDATE %s SET spent_by = (SELECT st FROM _sp"
+                    "  WHERE _sp.txid = %s.txid AND _sp.n = %s.n) "
+                    "WHERE (txid, n) IN (SELECT txid, n FROM _sp)"
+                    % (table, table, table))
+            self.conn.execute("DROP TABLE _sp")
+            # is_spent is now spent_by & 3 and nothing reads it, so it goes.
+            # DROP COLUMN is a schema edit rather than a table rewrite for an
+            # unindexed column, which is why it is safe to do on 7M rows here.
+            # Absent on a database created from the current SCHEMA, which never
+            # had it.
+            if "is_spent" in {r[1] for r in self.conn.execute(
+                    "PRAGMA table_info(addr_out)")}:
+                self.conn.execute("ALTER TABLE addr_out DROP COLUMN is_spent")
+            self.conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_addr_out_addr ON addr_out"
+                "(address, value, spent_by, mempool, txid, n)")
+            self.conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_vout_script ON vout"
+                "(script_hash, value, spent_by, mempool, txid, n)")
+            # Superseded by idx_vout_script, which leads with the same column
+            # and so answers everything the old one did plus the balance query.
+            self.conn.execute("DROP INDEX IF EXISTS idx_vout_script_hash")
+            self.set_meta("spent_mask", "1")
+            self.conn.commit()
         except BaseException:
             self.conn.rollback()
             raise
@@ -440,12 +613,28 @@ class DB:
             self._clear_from(height)
 
     def _refresh_spent_flags(self, outputs):
-        """Recompute addr_out.is_spent for the given (txid, n) outputs.
+        """Recompute spent_by for the given (txid, n) outputs, in both tables.
 
         The surviving vin rows are the authority, so a conflict stays right: an
         output two known txs both spend still counts as spent after either one
         is re-indexed or removed. Every writer goes through here, which is what
-        makes the flag independent of the order txs were added in.
+        makes the mask independent of the order txs were added in.
+
+        Both addr_out and vout are updated from the same pairs, because the
+        two balance views are asked the same question of an output and vout is
+        the only place a multisig's answer exists: a multi-address output
+        contributes to no single addr_out row, so before this, script_balances
+        was the one lookup that had to re-derive the fact from vin on every
+        request. Same pairs, same pass -- the addresses and the script of one
+        output are not the same rows, so leaving vout behind meant a second
+        derivation rather than a cheaper one.
+
+        The mask carries the spender's status, not just its existence, because
+        "spent" and "confirmed-spent" are different questions: an output spent
+        only by a mempool tx is confirmed-unspent, since a mempool spend can
+        still evaporate. Deriving the second from the first is not possible --
+        it is the difference between a mempool-only spender and a confirmed
+        one, which the old single boolean did not record.
 
         Batched, because this was the last statement left that scaled with the
         work: an eviction or a reorg hands us a pair per output affected, and a
@@ -459,15 +648,34 @@ class DB:
         per = max(1, SQL_VAR_CHUNK // 2)       # two binds per (txid, n) pair
         for i in range(0, len(outputs), per):
             chunk = outputs[i:i + per]
-            self.conn.execute(
-                """WITH p(txid, n) AS (VALUES %s)
-                   UPDATE addr_out SET is_spent = EXISTS (
-                       SELECT 1 FROM vin
-                       WHERE vin.prev_txid = addr_out.txid
-                         AND vin.prev_vout = addr_out.n)
-                   WHERE (addr_out.txid, addr_out.n) IN (SELECT txid, n FROM p)"""
-                % ",".join(["(?,?)"] * len(chunk)),
-                [x for pair in chunk for x in pair])
+            binds = [x for pair in chunk for x in pair]
+            for table in ("addr_out", "vout"):
+                # Two EXISTS rather than one scan of vin grouped by output: the
+                # pairs are already bounded by the chunk, and a group-by would
+                # have to walk every vin row sharing the output. The status is
+                # read through txs because a vin row's own status is its
+                # owner's, which is the thing being asked about here.
+                self.conn.execute(
+                    """WITH p(txid, n) AS (VALUES %s)
+                       UPDATE %s SET spent_by =
+                           (CASE WHEN EXISTS (
+                                SELECT 1 FROM vin
+                                JOIN txs ON txs.txid = vin.txid
+                                WHERE vin.prev_txid = %s.txid
+                                  AND vin.prev_vout = %s.n
+                                  AND txs.status = 'confirmed')
+                             THEN 1 ELSE 0 END)
+                         | (CASE WHEN EXISTS (
+                                SELECT 1 FROM vin
+                                JOIN txs ON txs.txid = vin.txid
+                                WHERE vin.prev_txid = %s.txid
+                                  AND vin.prev_vout = %s.n
+                                  AND txs.status = 'mempool')
+                             THEN 2 ELSE 0 END)
+                       WHERE (%s.txid, %s.n) IN (SELECT txid, n FROM p)"""
+                    % (",".join(["(?,?)"] * len(chunk)), table,
+                       table, table, table, table, table, table),
+                    binds)
 
     def _delete_tx_rows(self, txids):
         """Delete every row derived from these txids, and nothing else.
@@ -610,6 +818,14 @@ class DB:
                 "SELECT COALESCE(SUM(value),0) FROM vout WHERE txid=?",
                 (t.txid,)).fetchone()[0]
         self._delete_tx_rows([t.txid])
+        # The one place a row's confirmed-vs-mempool bit is decided. Set from
+        # the incoming tx's height and never revisited afterwards, because
+        # orphaned rows are deleted rather than flagged, so an output's owner
+        # cannot change status without the output row itself being rebuilt
+        # here. Deriving it per read instead meant a txs lookup per output,
+        # which on the 510k-output address was 510k random seeks to learn
+        # something every row already knew.
+        mempool = 0 if t.height is not None else 1
         self.conn.execute(
             """INSERT INTO txs
                (txid, height, tx_index, version, locktime, size,
@@ -631,11 +847,11 @@ class DB:
             self.conn.execute(
                 """INSERT INTO vout
                    (txid, n, value, type, addresses, req_sigs,
-                    script_asm, script_hex, script_hash)
-                   VALUES (?,?,?,?,?,?,?,?,?)""",
+                    script_asm, script_hex, script_hash, mempool)
+                   VALUES (?,?,?,?,?,?,?,?,?,?)""",
                 (t.txid, n, ot.value, ot.type,
                  json.dumps(ot.addresses), ot.req_sigs,
-                 ot.script_asm, ot.script_hex, sh))
+                 ot.script_asm, ot.script_hex, sh, mempool))
             # Consensus accounting lives at SCRIPT level: the output belongs
             # to the whole script (all-of-N participants for multisig), not
             # to any single participant. So a multi-address vout credits no
@@ -643,9 +859,9 @@ class DB:
             if len(ot.addresses) == 1:
                 self.conn.execute(
                     """INSERT INTO addr_out
-                       (address, txid, n, value, type)
-                       VALUES (?,?,?,?,?)""",
-                    (ot.addresses[0], t.txid, n, ot.value, ot.type))
+                       (address, txid, n, value, type, mempool)
+                       VALUES (?,?,?,?,?,?)""",
+                    (ot.addresses[0], t.txid, n, ot.value, ot.type, mempool))
             if sh is not None:
                 # Metadata only. Balances are derived from vout/vin on read (see
                 # DB.script_balances), so nothing here is a counter that a
@@ -905,6 +1121,56 @@ class DB:
             self.conn.rollback()
             raise
 
+    # The two balance views, as one index-only scan each. Written once and
+    # parameterised because addr_out and vout ask the identical question of an
+    # output and only the table and the count column differ; the views used to
+    # be four near-identical statements per lookup, which is how a 41s request
+    # came to be four separate 3-12s scans of the same rows.
+    #
+    # `owner` is the condition the view puts on the output's own tx, and
+    # `spender` the bit it tests on who spent it. Both are columns now rather
+    # than joins to txs and a correlated EXISTS into vin, so neither view
+    # touches a table outside the one being aggregated -- which is what lets
+    # the covering index answer it without a row fetch.
+    #
+    # The "confirmed" and "live" differ only in whether mempool rows count, and
+    # live is the unconditional one: an output's owner is confirmed or mempool
+    # and never orphaned, because _clear_from deletes an orphan's rows instead
+    # of keeping them flagged. That invariant is what lets the live view skip
+    # the status test the confirmed view still needs, and it is why no
+    # statement here mentions txs at all.
+    _BALANCE_VIEWS = (
+        # view        owner        spender
+        ("confirmed", "mempool=0", "spent_by & 1"),
+        ("live",      "1",         "spent_by & 3"),
+    )
+
+    def _balances(self, table, key_col, key, count_col):
+        """Confirmed and live balances for one address or script_hash.
+
+        One statement per view, aggregating received and spent together, so a
+        view costs a single pass over the rows instead of two passes that
+        differ only in a trailing EXISTS. `n_spent` counts outputs, not
+        spending inputs: an output two txs both spend still counts once, which
+        is what keeps a conflict from being charged to the balance twice.
+        """
+        out = {}
+        for view, owner, spender in self._BALANCE_VIEWS:
+            received, n_out, spent, n_spent = self.conn.execute(
+                "SELECT COALESCE(SUM(CASE WHEN %s THEN value END),0), "
+                "       COUNT(CASE WHEN %s THEN 1 END), "
+                "       COALESCE(SUM(CASE WHEN %s AND (%s) THEN value END),0), "
+                "       COUNT(CASE WHEN %s AND (%s) THEN 1 END) "
+                "FROM %s WHERE %s=?" % (owner, owner, owner, spender,
+                                        owner, spender, table, key_col),
+                (key,)).fetchone()
+            out[view] = {
+                "value_received": received, count_col: n_out,
+                "value_spent": spent, "n_spent": n_spent,
+                "balance": received - spent,
+            }
+        return out
+
     def script_balances(self, script_hash):
         """Return {"confirmed": {...}, "live": {...}} for one script.
 
@@ -918,38 +1184,17 @@ class DB:
         * live -- every output the index knows about, minus every output some
           known tx spends. This is "what could be spent right now".
 
-        Spends are matched with EXISTS over vin rather than joined, so an
-        output counts once however many txs spend it: counting per spending
-        input double-counted conflicting txs and drove the balance negative.
-        n_spent therefore means "outputs of this script currently spent", not
-        "spending inputs seen".
+        Spends are matched by the row's own spent_by mask rather than joined or
+        re-derived from vin, so an output counts once however many txs spend
+        it: counting per spending input double-counted conflicting txs and
+        drove the balance negative. n_spent therefore means "outputs of this
+        script currently spent", not "spending inputs seen".
 
         This is the only balance view a multisig gets: a multi-address vout
         contributes to no single addr_out row, so the script is where all-of-N
         money is visible at all.
         """
-        live = "('confirmed','mempool')"
-        out = {}
-        for key, status in (("confirmed", "('confirmed')"), ("live", live)):
-            received, n_vout = self.conn.execute(
-                "SELECT COALESCE(SUM(v.value),0), COUNT(*) FROM vout v "
-                "JOIN txs t ON t.txid = v.txid "
-                "WHERE v.script_hash=? AND t.status IN %s" % status,
-                (script_hash,)).fetchone()
-            spent, n_spent = self.conn.execute(
-                "SELECT COALESCE(SUM(v.value),0), COUNT(*) FROM vout v "
-                "JOIN txs t ON t.txid = v.txid "
-                "WHERE v.script_hash=? AND t.status IN %s "
-                "AND EXISTS (SELECT 1 FROM vin i JOIN txs ti ON ti.txid=i.txid "
-                "WHERE i.prev_txid=v.txid AND i.prev_vout=v.n "
-                "AND ti.status IN %s)" % (status, status),
-                (script_hash,)).fetchone()
-            out[key] = {
-                "value_received": received, "n_vout": n_vout,
-                "value_spent": spent, "n_spent": n_spent,
-                "balance": received - spent,
-            }
-        return out
+        return self._balances("vout", "script_hash", script_hash, "n_vout")
 
     def address_balances(self, address):
         """Return {"confirmed": {...}, "live": {...}} for one address.
@@ -957,28 +1202,7 @@ class DB:
         Same semantics as script_balances, but over addr_out, which only holds
         single-address outputs -- a multisig script has no addr_out rows at all.
         """
-        out = {}
-        for key, status in (("confirmed", "('confirmed')"),
-                            ("live", "('confirmed','mempool')")):
-            received, n_out = self.conn.execute(
-                "SELECT COALESCE(SUM(a.value),0), COUNT(*) FROM addr_out a "
-                "JOIN txs t ON t.txid = a.txid "
-                "WHERE a.address=? AND t.status IN %s" % status,
-                (address,)).fetchone()
-            spent, n_spent = self.conn.execute(
-                "SELECT COALESCE(SUM(a.value),0), COUNT(*) FROM addr_out a "
-                "JOIN txs t ON t.txid = a.txid "
-                "WHERE a.address=? AND t.status IN %s "
-                "AND EXISTS (SELECT 1 FROM vin i JOIN txs ti ON ti.txid=i.txid "
-                "WHERE i.prev_txid=a.txid AND i.prev_vout=a.n "
-                "AND ti.status IN %s)" % (status, status),
-                (address,)).fetchone()
-            out[key] = {
-                "value_received": received, "n_outputs": n_out,
-                "value_spent": spent, "n_spent": n_spent,
-                "balance": received - spent,
-            }
-        return out
+        return self._balances("addr_out", "address", address, "n_outputs")
 
     def rebuild_scripts(self, script_hashes=None):
         """Recompute the scripts table's metadata.

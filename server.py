@@ -253,32 +253,29 @@ class Explorer:
             return None
         bal = self.db.address_balances(addr)
         outs = self.db.query(
-            "SELECT txid, n, value, type, is_spent FROM addr_out "
+            "SELECT txid, n, value, type, spent_by FROM addr_out "
             "WHERE address=? ORDER BY txid, n LIMIT ?",
             (addr, self.ADDR_OUT_LIMIT))
         # Every transaction spending one of this address's outputs, in a single
-        # enumeration. The per-output spent_confirmed set and the spending half
-        # of the txs list both come from it, so a busy address is not walked
-        # twice for the two purposes; is_spent is live (a mempool spend sets it),
-        # so per-output status is reported as both readings rather than one
-        # "spent" flag.
+        # enumeration, for the spending half of the txs list below. The per-output
+        # spent_confirmed flag no longer comes from here: it is spent_by's
+        # confirmed bit, read off the row we already fetched, so the two views of
+        # an output's status are no longer derived by walking the address twice
+        # for two purposes.
         #
         # Orphaned txs are excluded: the txs list is current history, and no
-        # other endpoint counts an orphan anywhere. Reorgs already sever an
-        # orphan's vin rows (db._clear_from), so the join could not see one
-        # anyway -- the status filter states the contract here rather than
-        # leaning on that data-layer detail alone.
-        spends = self.db.query(
-            "SELECT i.txid, i.prev_txid, i.prev_vout, t.status FROM vin i"
+        # other endpoint counts an orphan anywhere. Reorgs sever an orphan's vin
+        # rows (db._clear_from), so the join could not see one on a real
+        # database -- but the filter states the contract rather than leaning on
+        # that data-layer detail alone, and an orphan test that leaves the rows
+        # in place is exactly the case where leaning on it would be wrong.
+        # Dropping this join was measured as worth ~4s on the 510k-output
+        # address and is not worth weakening the guarantee for.
+        spend_txids = set(r[0] for r in self.db.query(
+            "SELECT i.txid FROM vin i"
             " JOIN txs t ON t.txid = i.txid"
             " JOIN addr_out a ON a.txid = i.prev_txid AND a.n = i.prev_vout"
-            " WHERE a.address=? AND t.status != 'orphaned'", (addr,))
-        spend_txids = set()
-        spent_confirmed = set()
-        for txid, prev_txid, prev_vout, status in spends:
-            spend_txids.add(txid)
-            if status == "confirmed":
-                spent_confirmed.add((prev_txid, prev_vout))
+            " WHERE a.address=? AND t.status != 'orphaned'", (addr,)))
         # Transactions touching the address from either side: the receiving ones
         # straight from addr_out (the primary key streams them in txid order),
         # unioned with the spenders above, deduped and sorted in Python. The
@@ -303,8 +300,11 @@ class Explorer:
             "outputs": [
                 {"txid": r[0], "n": r[1], "value": r[2],
                  "value_hex": poke(r[2]), "type": r[3],
-                 "spent": bool(r[4]),
-                 "spent_confirmed": (r[0], r[1]) in spent_confirmed}
+                 # spent_by is a mask, so the live reading is "any bit" and the
+                 # confirmed one is the low bit -- the same split the balances
+                 # use, read here per output rather than aggregated.
+                 "spent": bool(r[4] & 3),
+                 "spent_confirmed": bool(r[4] & 1)}
                 for r in outs
             ],
         }
