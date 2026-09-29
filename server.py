@@ -32,44 +32,20 @@ import signal
 import socket
 import sqlite3
 import sys
-import threading
-import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse
 
-from db import DB, COIN
+from db import DB, COIN, TOTAL_COINBASE_SQL
 
 WEB_ROOT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "web")
 
 BLOCK_COLS = ["height", "hash", "version", "merkleroot", "time", "nonce",
               "bits", "difficulty", "size", "prev_hash", "next_hash"]
 
-# Cumulative minted supply: every coinbase output ever indexed. This is NOT
-# "outstanding/unspent" — it is never decremented by spends. (A true unspent
-# figure would need a UTXO model, e.g. subtracting spent prevouts.)
-#
-# The status='confirmed' is redundant today: clear_from() deletes the vout rows
-# of the txs it orphans, so an orphaned coinbase contributes nothing either way.
-# It stays because that redundancy is invisible from this query alone, and the
-# invariant is worth stating here rather than leaving it to a reader who does
-# not know what clear_from() does. A surviving orphan vout would otherwise
-# silently inflate minted supply for the life of the process.
-TOTAL_COINBASE_SQL = (
-    "SELECT COALESCE(SUM(v.value),0) FROM vout v JOIN txs t "
-    "ON v.txid = t.txid WHERE t.is_coinbase = 1 AND t.status = 'confirmed'")
-
-# The cache is keyed on the tip HASH, not the tip height. A reorg can replace
-# the block at the current tip without changing its height, so a height key
-# would keep serving the pre-reorg total. Hash changes on every reorg, and the
-# sum only moves when a coinbase is indexed or orphaned, which always comes
-# with a tip change.
-TIP_HASH_SQL = "SELECT hash FROM blocks ORDER BY height DESC LIMIT 1"
-_TOTAL_LOCK = threading.Lock()
-_TOTAL_CACHE = None  # (tip_hash, pokes)
-
-
-def _total_coinbase_query(db):
-    return db.query(TOTAL_COINBASE_SQL)[0][0]
+# TOTAL_COINBASE_SQL lives in db.py now: it is the definition behind the
+# maintained counter that db.total_coinbase() reads, and re-deriving it per
+# request is what made this endpoint take 31 seconds. It is re-exported here
+# so the tests that assert the read path never runs it keep resolving it.
 
 
 def poke(v):
@@ -149,22 +125,18 @@ class Explorer:
         self.db = db
 
     def total_coinbase(self):
-        # Keyed on the tip hash so a new block (or a reorg at the same height)
-        # invalidates immediately, instead of going stale for up to 60s. The
-        # validity check is a 0.015 ms indexed lookup; the value it guards is an
-        # 84 ms scan of every vout row on a 2000-block chain, and that gap is
-        # what the cache is for.
-        global _TOTAL_CACHE
-        rows = self.db.query(TIP_HASH_SQL)
-        tip = rows[0][0] if rows else None
-        with _TOTAL_LOCK:
-            c = _TOTAL_CACHE
-            if c and c[0] == tip:
-                return c[1]
-        val = _total_coinbase_query(self.db)
-        with _TOTAL_LOCK:
-            _TOTAL_CACHE = (tip, val)
-        return val
+        # A single indexed meta lookup. This used to be a scan of every vout
+        # row, cached on the tip hash and recomputed whenever the indexer moved
+        # the tip -- which, on a chain being indexed continuously, was every
+        # page load. 31s per request on 4.6M blocks, and the background thread
+        # recomputing it held a read snapshot that stopped SQLite from ever
+        # resetting the WAL, so the file grew to 33GB and every read got
+        # slower, which made the scan slower still.
+        #
+        # The counter is maintained by the same transaction that writes the
+        # rows it summarises, so this needs no cache and cannot be stale
+        # against the data it is read alongside.
+        return self.db.total_coinbase()
 
     def summary(self):
         rows = self.db.query(
@@ -172,12 +144,15 @@ class Explorer:
             "difficulty, size, prev_hash, next_hash FROM blocks "
             "ORDER BY height DESC LIMIT 1")
         tip = rows[0] if rows else None
-        nblocks = self.db.query("SELECT COUNT(*) FROM blocks")[0][0]
-        ntx = self.db.query(
-            "SELECT COUNT(*) FROM txs WHERE status != 'orphaned'")[0][0]
         if not tip:
             return {"tip": None}
         tipdict = dict(zip(BLOCK_COLS, tip))
+        # The two counts and the supply are read from the maintained counters
+        # rather than counted: COUNT(*) over 4.6M blocks and 5.3M txs is a full
+        # index scan each, 0.28s and 0.63s, on the path every page load takes.
+        # See DB._backfill_stats for why the counters are exact.
+        nblocks = self.db.n_blocks()
+        ntx = self.db.n_txs()
         tip_ntx = self.db.query(
             "SELECT COUNT(*) FROM txs WHERE height=? AND status='confirmed'",
             (tipdict["height"],))[0][0]
@@ -366,6 +341,13 @@ class DualStackHTTPServer(ThreadingHTTPServer):
 class Handler(BaseHTTPRequestHandler):
     pool = None            # set once in main(); a DBPool
 
+    # HTTP/1.1 so a page load's three requests (document, summary, recent
+    # blocks) reuse one connection. The default is HTTP/1.0, which closes the
+    # socket after every response, so the browser paid three TCP handshakes to
+    # render one page. Safe here because every response below sets
+    # Content-Length, which is what tells the client where a body ends.
+    protocol_version = "HTTP/1.1"
+
     def log_message(self, fmt, *args):
         ip = self.client_address[0] if self.client_address else "?"
         print("%s %s" % (ip, fmt % args), flush=True)
@@ -403,6 +385,19 @@ class Handler(BaseHTTPRequestHandler):
                 not os.path.isfile(target):
             self._send_404()
             return
+        stat = os.stat(target)
+        etag = '"%x-%x-%x"' % (stat.st_ino, stat.st_mtime_ns, stat.st_size)
+        # The document is the same bytes on every page load, and it is the one
+        # response that does not need the database at all -- so it is the one
+        # that can be answered without reading anything. A returning visitor
+        # revalidates and gets a 304 with no body; the first load reads the
+        # file once and lets the browser keep it.
+        if self.headers.get("If-None-Match") == etag:
+            self.send_response(304)
+            self.send_header("ETag", etag)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
         with open(target, "rb") as f:
             body = f.read()
         ctype = "text/html" if target.endswith(".html") else \
@@ -412,6 +407,12 @@ class Handler(BaseHTTPRequestHandler):
         self.send_response(200)
         self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(body)))
+        self.send_header("ETag", etag)
+        # The UI is one self-contained file with no build step, so a stale
+        # copy in a browser cache is the only way a fix can fail to reach
+        # anyone. must-revalidate keeps the 304 cheap without pinning them to
+        # a copy they cannot refresh.
+        self.send_header("Cache-Control", "no-cache, must-revalidate")
         self.end_headers()
         self.wfile.write(body)
 
@@ -459,38 +460,6 @@ class Handler(BaseHTTPRequestHandler):
         self._send(*res)
 
 
-def _total_coinbase_loop(db_path, interval=5):
-    """Keep the coinbase cache warm so requests never pay the vout scan.
-
-    This used to recompute the sum on a 60s timer. It now watches the tip hash
-    instead and recomputes only when it moves: the poll is an indexed lookup
-    (0.015 ms) where the sum is a full scan of vout (84 ms on a 2000-block
-    chain), so an idle explorer now does ~0.02 ms of work every 5s rather than
-    an 84 ms scan every 60s, and the value is never stale by more than one
-    poll interval. total_coinbase() recomputes on demand too, so correctness
-    never depends on this thread running.
-
-    connect(), not DB(): this thread is a reader, and it must not race the
-    indexer into a schema migration. main() has already initialized.
-    """
-    db = DB.connect(db_path)
-    global _TOTAL_CACHE
-    while True:
-        try:
-            rows = db.query(TIP_HASH_SQL)
-            tip = rows[0][0] if rows else None
-            with _TOTAL_LOCK:
-                c = _TOTAL_CACHE
-                fresh = c is not None and c[0] == tip
-            if not fresh:
-                val = _total_coinbase_query(db)
-                with _TOTAL_LOCK:
-                    _TOTAL_CACHE = (tip, val)
-        except sqlite3.Error:
-            pass
-        time.sleep(interval)
-
-
 def main():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("db", nargs="?", default="explorer.db")
@@ -500,8 +469,6 @@ def main():
 
     DB.initialize(args.db)   # create/migrate the schema exactly once
     Handler.pool = DBPool(args.db)   # and warm the read connections
-    threading.Thread(target=_total_coinbase_loop, args=(args.db,),
-                     daemon=True).start()
     server_cls = DualStackHTTPServer
     if ":" not in args.host:  # literal IPv4 address -> plain IPv4 bind
         server_cls = ThreadingHTTPServer

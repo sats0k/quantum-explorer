@@ -1610,11 +1610,14 @@ class TxRetrievalDialogTest(DBTestCase):
 
 
 class TotalCoinbaseCacheTest(DBTestCase):
-    """The cache is keyed on the tip hash, so it cannot go stale."""
+    """The maintained total must never drift from the query that defines it.
 
-    def setUp(self):
-        super().setUp()
-        server_module._TOTAL_CACHE = None
+    There is no cache to expire any more: db.py keeps the running total in
+    the same transaction as the rows it sums, so what these tests pin is the
+    stronger property -- that every path which can change the figure changes
+    the counter too, and that the counter is readable without the 31s scan
+    that used to sit behind every /api/summary.
+    """
 
     def coinbase_block(self, height, tag, pokes=50 * POKE):
         """One block whose single coinbase is worth `pokes`."""
@@ -1625,6 +1628,18 @@ class TotalCoinbaseCacheTest(DBTestCase):
         self.db.add_tx(tx("C%d" % height, height,
                           [("miner", pokes, 1)], coinbase=True))
         return tag
+
+    def derived(self):
+        """The total as the defining query computes it, ignoring the counter."""
+        return self.db.conn.execute(
+            db_module.TOTAL_COINBASE_SQL).fetchone()[0]
+
+    def assertMatchesDerived(self, msg=""):
+        """Every maintained counter must equal the query that defines it."""
+        for key, sql in db_module.STATS:
+            self.assertEqual(self.db._stat(key),
+                             self.db.conn.execute(sql).fetchone()[0],
+                             "%s: %s" % (key, msg))
 
     def test_a_new_block_is_visible_immediately(self):
         # The old cache held its value for 60s regardless of the chain.
@@ -1656,8 +1671,10 @@ class TotalCoinbaseCacheTest(DBTestCase):
         self.assertEqual(self.explorer.total_coinbase(), 50 * POKE)
 
     def test_the_repeated_value_is_served_from_cache(self):
-        # Same tip hash => no rescan. Count the SUM statements, not the total
-        # query count, so the tip-hash probe is not mistaken for a recompute.
+        # Repeated reads must not run the sum. This is the regression that
+        # matters: the scan behind TOTAL_COINBASE_SQL took 31s on a 4.6M-block
+        # chain, and it was re-run on the read path every time the indexer
+        # moved the tip -- which is every page load on a chain being indexed.
         self.coinbase_block(1, "h1")
         self.explorer.total_coinbase()
         sums = []
@@ -1671,12 +1688,157 @@ class TotalCoinbaseCacheTest(DBTestCase):
         with mock.patch.object(DB, "query", spy):
             for _ in range(5):
                 self.explorer.total_coinbase()
-        self.assertEqual(sums, [], "the sum was recomputed with a stable tip")
+        self.assertEqual(sums, [], "the sum was recomputed on the read path")
+        self.assertMatchesDerived()
 
-    def test_the_cache_does_not_leak_between_databases(self):
-        # The cache is a module global; two DBs with different tips must not
-        # share an entry, or a second server on another chain shows the first
-        # chain's supply.
+    def test_reindexing_a_coinbase_does_not_double_count(self):
+        # _add_tx deletes and reinserts, so a naive "add the new value" would
+        # pay the coinbase twice on every re-index of a height. The block and
+        # tx counts have to survive the same round trip.
+        self.coinbase_block(1, "h1")
+        before = self.explorer.total_coinbase()
+        self.coinbase_block(1, "h1")            # same txid, same block
+        self.assertEqual(self.explorer.total_coinbase(), before)
+        self.assertMatchesDerived()
+
+    def test_reindexing_a_block_at_a_known_height_does_not_count_it_twice(self):
+        # _add_block is INSERT OR REPLACE, which reports nothing about whether
+        # it inserted or replaced. n_blocks is a count of heights, so a
+        # re-indexed height has to leave it alone.
+        from indexer import Block
+        for _ in range(2):
+            self.db.add_block(Block({"height": 7, "hash": "h7", "time": 1,
+                                     "tx": ["C7"]}))
+            self.db.add_tx(tx("C7", 7, [("miner", 50 * POKE, 0)],
+                              coinbase=True))
+        self.assertEqual(self.db.n_blocks(), 1)
+        self.assertEqual(self.db.n_txs(), 1)
+        self.assertMatchesDerived()
+
+    def test_a_multi_output_coinbase_counts_every_output(self):
+        # The figure is a sum over outputs, not over coinbase txs: a coinbase
+        # paying two outputs is worth both.
+        from indexer import Block
+        self.db.add_block(Block({"height": 1, "hash": "h1", "time": 1,
+                                 "tx": ["C1"]}))
+        self.db.add_tx(tx("C1", 1, [("a", 30 * POKE, 0),
+                                    ("b", 20 * POKE, 1)], coinbase=True))
+        self.assertEqual(self.explorer.total_coinbase(), 50 * POKE)
+        self.assertMatchesDerived()
+
+    def test_an_unconfirmed_coinbase_is_not_minted(self):
+        # A coinbase seen in the mempool has no height, so it is not minted
+        # until a block claims it. The counter keys off height, not is_coinbase.
+        self.db.add_tx(tx("C1", None, [("miner", 50 * POKE, 0)],
+                          coinbase=True))
+        self.assertEqual(self.explorer.total_coinbase(), 0)
+        self.assertMatchesDerived()
+
+    def test_removing_a_confirmed_coinbase_retracts_it(self):
+        # remove_txs() is built for mempool eviction, where this returns 0.
+        # It is public API though, so the counter must not assume the caller
+        # only ever passes the kind of txid it means to.
+        self.coinbase_block(1, "h1")
+        self.coinbase_block(2, "h2")
+        self.assertEqual(self.explorer.total_coinbase(), 100 * POKE)
+        self.db.remove_txs(["C2"])
+        self.assertEqual(self.explorer.total_coinbase(), 50 * POKE)
+        self.assertEqual(self.db.n_txs(), 1)
+        self.assertMatchesDerived()
+
+    def test_orphaning_a_block_lowers_the_block_and_tx_counts(self):
+        # clear_from() deletes blocks outright but tombstones their txs, so
+        # n_blocks falls by the depth of the reorg while n_txs falls too --
+        # an orphan is not counted, which is what the defining query says.
+        for h in range(1, 5):
+            self.coinbase_block(h, "h%d" % h)
+        self.assertEqual((self.db.n_blocks(), self.db.n_txs()), (4, 4))
+        self.db.clear_from(3)
+        self.assertEqual((self.db.n_blocks(), self.db.n_txs()), (2, 2))
+        self.assertMatchesDerived()
+
+    def test_orphaned_tombstone_pruning_does_not_retract_twice(self):
+        # An orphan is already out of the total when it is orphaned; deleting
+        # the tombstone years later must move nothing, or a reorg would drive
+        # the total negative.
+        self.coinbase_block(1, "h1")
+        for h in range(2, 12):
+            self.coinbase_block(h, "h%d" % h)
+        self.db.clear_from(2)
+        self.assertEqual(self.explorer.total_coinbase(), 50 * POKE)
+        self.assertMatchesDerived()
+        db_module.ORPHAN_RETENTION = 1
+        try:
+            tip = self.db.tip_height()
+            self.db.clear_from(tip)   # prunes orphans older than retention
+        finally:
+            db_module.ORPHAN_RETENTION = 20000
+        self.assertMatchesDerived("pruning an orphan retracted it a second time")
+
+    def test_a_reorg_then_replacement_nets_to_the_replacement(self):
+        # The exact sequence the indexer runs on a reorg: truncate, re-index
+        # the same heights with different hashes. Two retractions and two
+        # additions have to leave the replacement's value and nothing else.
+        self.coinbase_block(1, "h1")
+        self.coinbase_block(2, "h2", pokes=10 * POKE)
+        self.db.clear_from(2)
+        self.assertMatchesDerived("after truncation")
+        self.coinbase_block(2, "h2-new", pokes=80 * POKE)
+        self.assertEqual(self.explorer.total_coinbase(), 50 * POKE + 80 * POKE)
+        self.assertMatchesDerived("after the replacement block")
+
+    def test_a_bulk_of_blocks_and_mempool_txs_keeps_the_counter_exact(self):
+        # The indexer writes a whole window inside one transaction, mixing
+        # confirmed coinbases with mempool churn. _bump_coinbase_total must not
+        # commit that transaction early, and the total must survive it.
+        from indexer import Block
+        with self.db.bulk():
+            for h in range(1, 6):
+                self.db.add_block(Block({"height": h, "hash": "b%d" % h,
+                                         "time": 1, "tx": ["C%d" % h, "P%d" % h]}))
+                self.db.add_tx(tx("C%d" % h, h, [("miner", 50 * POKE, 0)],
+                                  coinbase=True))
+                self.db.add_tx(tx("P%d" % h, None, [("pay", 7 * POKE, 0)]))
+        self.assertEqual(self.explorer.total_coinbase(), 250 * POKE)
+        self.assertMatchesDerived()
+        self.db.remove_txs(["P%d" % h for h in range(1, 6)])
+        self.assertEqual(self.explorer.total_coinbase(), 250 * POKE)
+        self.assertMatchesDerived()
+
+    def test_recompute_repairs_a_counter_that_was_corrupted(self):
+        # The counters are maintained, not derived, so a value that drifted
+        # would be served forever. recompute_stats() is the hatch.
+        self.coinbase_block(1, "h1")
+        self.coinbase_block(2, "h2")
+        self.db.conn.execute(
+            "UPDATE meta SET value='1' WHERE key IN (?,?)",
+            (db_module.COINBASE_TOTAL_KEY, db_module.N_BLOCKS_KEY))
+        self.db.conn.commit()
+        self.assertEqual(self.db.total_coinbase(), 1)
+        self.assertEqual(self.db.n_blocks(), 1)
+        self.db.recompute_stats()
+        self.assertEqual(self.db.total_coinbase(), 100 * POKE)
+        self.assertEqual(self.db.n_blocks(), 2)
+        self.assertMatchesDerived()
+
+    def test_the_read_path_works_before_the_counters_are_seeded(self):
+        # A read-only connection against a database written before the
+        # counters existed must not answer 0 for the chain's whole supply.
+        self.coinbase_block(1, "h1")
+        self.coinbase_block(2, "h2")
+        self.db.conn.execute(
+            "DELETE FROM meta WHERE key IN (?,?,?)",
+            (db_module.COINBASE_TOTAL_KEY, db_module.N_BLOCKS_KEY,
+             db_module.N_TXS_KEY))
+        self.db.conn.commit()
+        self.assertEqual(self.db.total_coinbase(), 100 * POKE)
+        self.assertEqual(self.db.n_blocks(), 2)
+        self.assertEqual(self.db.n_txs(), 2)
+
+    def test_the_counter_does_not_leak_between_databases(self):
+        # The old cache was a module global, so two servers on two chains
+        # shared one entry and the second showed the first's supply. The
+        # counter is a row in each database's own meta table.
         self.coinbase_block(1, "h1")
         other = self.fresh_db()
         from indexer import Block

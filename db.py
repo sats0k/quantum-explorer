@@ -143,6 +143,54 @@ SCHEMA += SCRIPTS_TABLE + "\n" + SCRIPTS_INDEX
 
 ORPHAN_RETENTION = 20000  # tombstones kept this many blocks before pruning
 
+# Cumulative minted supply: every coinbase output ever indexed. This is NOT
+# "outstanding/unspent" -- it is never decremented by spends.
+#
+# This is the DEFINITION of the figure, not how it is read. Deriving it per
+# request meant joining every confirmed coinbase tx to its outputs: 4.6M
+# random seeks into the vout key on a 4.6M-block chain, measured at 31s, on
+# the /api/summary path of every page load. It stays here because it is what
+# the backfill computes and what repairs the counter below.
+#
+# The status='confirmed' filter is load-bearing, not redundant: a mempool tx
+# is not yet minted, and an orphaned one no longer counts.
+TOTAL_COINBASE_SQL = (
+    "SELECT COALESCE(SUM(v.value),0) FROM vout v JOIN txs t "
+    "ON v.txid = t.txid WHERE t.is_coinbase = 1 AND t.status = 'confirmed'")
+
+# The maintained running total. Unlike a balance, minted supply has no
+# mempool/confirmed split to get wrong and no double-spend to net out: it is
+# a plain accumulator over coinbase outputs, and the write path already knows
+# each coinbase tx's output values at insert time. So it is kept in the same
+# transaction as the rows it describes -- a reader takes one indexed meta
+# lookup instead of a 31s scan, and sees the counter and the data from a
+# single consistent snapshot because they commit together.
+COINBASE_TOTAL_KEY = "total_coinbase"
+N_BLOCKS_KEY = "n_blocks"
+N_TXS_KEY = "n_txs"
+
+# The other two figures /api/summary shows, and the queries that define them.
+# COUNT(*) over a 4.6M-row table is a full index scan whatever it counts:
+# 0.28s for blocks and 0.63s for txs, on every page load, growing with the
+# chain. They are maintained for the same reason and on the same terms.
+N_BLOCKS_SQL = "SELECT COUNT(*) FROM blocks"
+N_TXS_SQL = "SELECT COUNT(*) FROM txs WHERE status != 'orphaned'"
+
+# The three figures a reader asks for, and the SQL each is defined by. Kept as
+# one table so the counter and its definition cannot drift apart in the source:
+# a stat added here without a definition, or the reverse, is a mistake the
+# backfill turns into a wrong number rather than a loud failure.
+#
+# Each is an accumulator over rows the write path already touches, and each is
+# updated in the same transaction as those rows -- so a reader sees the counter
+# and the data from one consistent snapshot, and a crash rolls back both.
+STATS = (
+    (COINBASE_TOTAL_KEY, TOTAL_COINBASE_SQL),
+    (N_BLOCKS_KEY, N_BLOCKS_SQL),
+    (N_TXS_KEY, N_TXS_SQL),
+)
+STATS_SEEDED_KEY = "stats_seeded"
+
 # Bind parameters per statement, chunked. SQLITE_LIMIT_VARIABLE_NUMBER is
 # compiled in: 999 before SQLite 3.32, 32766 after, 250000 in recent versions.
 # An eviction or a reorg hands us an id list whose size we did not choose, and a
@@ -181,6 +229,31 @@ class DB:
     NORMAL_BUSY_TIMEOUT_MS = 5000
     MIGRATION_BUSY_TIMEOUT_MS = 1800000
 
+    # Per-connection page cache, in KiB (the negative form SQLite uses). The
+    # default is 2000 KiB, which against a 14 GB database means nearly every
+    # page a query touches costs a read() syscall. This is a pool of a few
+    # connections on the web side plus one in the indexer, not one per process
+    # per request, so 64 MiB each is a few hundred MiB in total.
+    CACHE_SIZE_KIB = 65536
+
+    # Bytes of the database a connection reads through mmap instead of
+    # read(). Repeat reads are then served by the OS page cache with no second
+    # copy, and -- the reason it matters most here -- the indexer's
+    # checkpoints no longer have to push pages through this process's own
+    # cache to make them visible to a reader.
+    MMAP_SIZE = 1 << 30
+
+    # Cap on how large the write-ahead log is left after a checkpoint. The
+    # default (-1) never truncates, and a WAL file is reused rather than
+    # shrunk, so its high-water mark is permanent: this database's reached
+    # 33 GB. That was a symptom, not the disease -- a reader holding a
+    # snapshot for 31s (the per-request minted-supply scan) meant no
+    # checkpoint could ever complete, so the log could never be reset at all.
+    # With that fixed the log checkpoints continuously, and this is what turns
+    # "checkpointed" into "reclaims the space": after each checkpoint the file
+    # is truncated back to this size instead of staying at its largest.
+    JOURNAL_SIZE_LIMIT = 64 << 20
+
     @classmethod
     def initialize(cls, path):
         """Create or migrate the schema, and return a usable connection.
@@ -211,6 +284,10 @@ class DB:
         self.conn = sqlite3.connect(path, check_same_thread=check_same_thread)
         self.conn.execute("PRAGMA journal_mode=WAL")
         self.conn.execute("PRAGMA synchronous=NORMAL")
+        self.conn.execute("PRAGMA cache_size=-%d" % self.CACHE_SIZE_KIB)
+        self.conn.execute("PRAGMA mmap_size=%d" % self.MMAP_SIZE)
+        self.conn.execute("PRAGMA journal_size_limit=%d"
+                          % self.JOURNAL_SIZE_LIMIT)
         # A migration may hold an EXCLUSIVE lock for minutes (the script_hash
         # backfill), and the other process opening this same file must wait for
         # it rather than die on a lock error -- so the long timeout applies to
@@ -223,6 +300,7 @@ class DB:
             return
         self.conn.executescript(SCHEMA)
         self._migrate()
+        self._backfill_stats()
         self.conn.commit()
         # Steady-state work -- indexing, and every web request -- waits only
         # briefly. A web reader that parks for MIGRATION_BUSY_TIMEOUT_MS turns
@@ -408,12 +486,34 @@ class DB:
                     "DELETE FROM %s WHERE txid IN (%s)" % (table, marks), chunk)
 
     def _clear_from(self, height):
+        # What this truncation retracts, read while the rows still hold their
+        # old status: the supply the orphaned coinbases carried, how many live
+        # txs they were, and how many blocks are about to go. Scoped to
+        # height>=?, not to every orphan ever -- a reorg from a year ago was
+        # already retracted, and retracting it again would drive the counts
+        # negative. The status/height index makes this a seek from the reorg
+        # point, so it costs the depth of the reorg, not the length of the
+        # chain.
+        orphaned_minted, orphaned_txs = self.conn.execute(
+            "SELECT COALESCE(SUM(v.value),0), COUNT(*) FROM txs t "
+            "JOIN vout v ON v.txid = t.txid "
+            "WHERE t.status='confirmed' AND t.is_coinbase=1 AND t.height >= ?",
+            (height,)).fetchone()
+        live_txs = self.conn.execute(
+            "SELECT COUNT(*) FROM txs WHERE status='confirmed' AND height >= ?",
+            (height,)).fetchone()[0]
+        dropped_blocks = self.conn.execute(
+            "SELECT COUNT(*) FROM blocks WHERE height >= ?",
+            (height,)).fetchone()[0]
         # Reorged-away confirmed txs become explicit tombstones instead of
         # disappearing; their vin/vout/addr_out rows are severed so no ghost
         # outputs leak into address queries.
         self.conn.execute(
             "UPDATE txs SET status='orphaned' WHERE height >= ? "
             "AND status='confirmed'", (height,))
+        self._bump(COINBASE_TOTAL_KEY, -orphaned_minted)
+        self._bump(N_TXS_KEY, -live_txs)
+        self._bump(N_BLOCKS_KEY, -dropped_blocks)
         # Snapshot what the severing invalidates, while the rows still exist:
         # which scripts lose an output, and which outputs lose a spender. Both
         # are gone by the time the work below runs, and neither can be
@@ -463,6 +563,11 @@ class DB:
             self.conn.execute(
                 "UPDATE blocks SET next_hash=? WHERE hash=?",
                 (b.hash, b.prev_hash))
+        # One primary-key seek to tell a new height from a re-index of one we
+        # already hold: INSERT OR REPLACE below cannot report which it did,
+        # and the block count is the number of heights, not of writes.
+        new_height = self.conn.execute(
+            "SELECT 1 FROM blocks WHERE height=?", (b.height,)).fetchone() is None
         self.conn.execute(
             """INSERT OR REPLACE INTO blocks
                (height, hash, version, merkleroot, time, nonce, bits,
@@ -470,6 +575,7 @@ class DB:
                VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
             (b.height, b.hash, b.version, b.merkleroot, b.time, b.nonce,
              b.bits, b.difficulty, b.size, b.prev_hash, b.next_hash))
+        self._bump(N_BLOCKS_KEY, 1 if new_height else 0)
 
     def add_tx(self, t):
         if not self._in_bulk:
@@ -489,6 +595,20 @@ class DB:
             "SELECT DISTINCT prev_txid, prev_vout FROM vin "
             "WHERE txid=? AND prev_txid IS NOT NULL", (t.txid,))
             if r not in held]
+        # What this tx already counted, read before its rows go away: the
+        # status that decides whether it was a live tx, and -- for a coinbase
+        # -- the supply it was counted at. is_coinbase is read off the stored
+        # row rather than off the incoming tx because the figure is defined
+        # over what is stored: a txid that somehow arrived with different
+        # inputs still has to leave the counter matching the rows.
+        prev = self.conn.execute(
+            "SELECT status, is_coinbase FROM txs WHERE txid=?",
+            (t.txid,)).fetchone()
+        prev_minted = 0
+        if prev is not None and prev[1] and prev[0] == "confirmed":
+            prev_minted = self.conn.execute(
+                "SELECT COALESCE(SUM(value),0) FROM vout WHERE txid=?",
+                (t.txid,)).fetchone()[0]
         self._delete_tx_rows([t.txid])
         self.conn.execute(
             """INSERT INTO txs
@@ -564,6 +684,16 @@ class DB:
         # that this one does not -- in one batched pass at the end.
         self._refresh_spent_flags(
             sorted(held) + [(t.txid, n) for n, _ in enumerate(t.vout)] + released)
+        # Minted supply moves by exactly what this version added over what the
+        # previous one had counted. height IS NULL while unconfirmed, so a
+        # mempool coinbase adds nothing until it is indexed into a block.
+        self._bump(COINBASE_TOTAL_KEY,
+                   (sum(ot.value for ot in t.vout) if t.height is not None else 0)
+                   - prev_minted)
+        # n_txs counts non-orphaned rows: a re-index of a live tx replaces it
+        # and nets to zero, while an orphan returning to the chain or the
+        # mempool is newly counted.
+        self._bump(N_TXS_KEY, 1 if prev is None or prev[0] == "orphaned" else 0)
 
     def remove_tx(self, txid):
         """Drop a tx and every row derived from it (stale mempool eviction).
@@ -605,8 +735,26 @@ class DB:
         # all-or-nothing: either every stale tx goes or none of it does.
         spent_prev = []
         touched = []
+        dropped_txs = 0
+        dropped_minted = 0
         for chunk in _chunks(txids):
             marks = ",".join("?" * len(chunk))
+            # ...and what they take out of the counters, read before the rows
+            # go. remove_txs() is documented for mempool eviction, where the
+            # supply half of this is 0 and a coinbase is never in the mempool
+            # -- but a displayed count should not rest on the caller only ever
+            # passing the kind of txid it means to. The count is of txs ROWS,
+            # so it is a plain COUNT and still right for a coinbase stored
+            # without outputs. Orphaned rows are already out of n_txs and
+            # deleting one must not retract again.
+            live, minted = self.conn.execute(
+                "SELECT COUNT(*), COALESCE(SUM(CASE WHEN t.is_coinbase=1 "
+                "AND t.status='confirmed' THEN (SELECT COALESCE(SUM(v.value),0) "
+                "FROM vout v WHERE v.txid = t.txid) ELSE 0 END), 0) "
+                "FROM txs t WHERE t.status != 'orphaned' AND t.txid IN (%s)"
+                % marks, chunk).fetchone()
+            dropped_txs += live
+            dropped_minted += minted
             # Snapshot the prevouts first: the rows go away with the txs, and the
             # recompute below needs to know which outputs they were holding.
             spent_prev += self.conn.execute(
@@ -638,9 +786,124 @@ class DB:
         # every output in the index. Chunked too: the scope is every script the
         # evicted txs touched, which is unbounded on the same terms.
         self.rebuild_scripts(touched)
+        self._bump(COINBASE_TOTAL_KEY, -dropped_minted)
+        self._bump(N_TXS_KEY, -dropped_txs)
 
     def query(self, sql, params=()):
         return self.conn.execute(sql, params).fetchall()
+
+    # --- maintained counters ---------------------------------------------
+    #
+    # Every write path that can change one of these updates it in the same
+    # transaction as the rows it counts, so nothing here needs a cache and
+    # nothing can be stale against the data it is read alongside. Each stat
+    # has exactly one writer per operation; the ones that can move are
+    # _add_tx (a tx indexed, re-indexed, or moved out of the orphan state),
+    # _add_block (a new height), _clear_from (a reorg) and _remove_txs (a
+    # drop). Tombstone pruning is deliberately not among them -- an orphan
+    # left the total when it was orphaned, so deleting the row later moves
+    # nothing, and retracting again would drive a count negative.
+
+    def _stat(self, key, default=0):
+        row = self.conn.execute(
+            "SELECT value FROM meta WHERE key=?", (key,)).fetchone()
+        return int(row[0]) if row and row[0] is not None else default
+
+    def _bump(self, key, delta):
+        """Add `delta` to a counter, inside the caller's transaction.
+
+        A bare execute(), never set_meta(): set_meta opens `with self.conn`,
+        which COMMITs, and that would end the surrounding bulk transaction
+        mid-block -- committing a half-indexed block and dropping the
+        EXCLUSIVE lock a migration is holding. Same reason
+        _migrate_scripts_columns avoids executescript().
+
+        Read-modify-write in Python rather than SQL arithmetic, so the value
+        is an int the whole way rather than a string that meta.value's TEXT
+        affinity has to round-trip on every block.
+        """
+        if not delta:
+            return
+        self.conn.execute(
+            "INSERT INTO meta(key, value) VALUES(?,?) "
+            "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            (key, str(self._stat(key) + delta)))
+
+    def total_coinbase(self):
+        """Minted supply in pokes: one indexed lookup, not a scan."""
+        return self._seeded_stat(COINBASE_TOTAL_KEY)
+
+    def n_blocks(self):
+        """Number of blocks held: one indexed lookup, not a table scan."""
+        return self._seeded_stat(N_BLOCKS_KEY)
+
+    def n_txs(self):
+        """Number of non-orphaned txs: one indexed lookup, not a table scan."""
+        return self._seeded_stat(N_TXS_KEY)
+
+    def _seeded_stat(self, key):
+        row = self.conn.execute(
+            "SELECT value FROM meta WHERE key=?", (key,)).fetchone()
+        if row is not None and row[0] is not None:
+            return int(row[0])
+        # Not seeded yet: a read-only connection against a database written
+        # before the counters existed. Derive the answer rather than serve a
+        # wrong zero; the writer seeds it on its next open.
+        return self._define_stat(key)
+
+    def _define_stat(self, key):
+        for name, sql in STATS:
+            if name == key:
+                return self.conn.execute(sql).fetchone()[0]
+        raise KeyError(key)
+
+    def recompute_stats(self):
+        """Rescan the chain and overwrite every counter. Returns {key: value}.
+
+        The repair hatch. Correctness never depends on the counters being
+        trusted -- every write path maintains them from the same transaction
+        as the rows -- but this is how you find out whether one drifted, and
+        how a database backfilled by an older build gets fresh values without
+        a scan running on a request.
+        """
+        out = {}
+        for key, sql in STATS:
+            value = self.conn.execute(sql).fetchone()[0]
+            self.conn.execute(
+                "INSERT INTO meta(key, value) VALUES(?,?) "
+                "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                (key, str(value)))
+            out[key] = value
+        return out
+
+    def _backfill_stats(self):
+        """Seed the counters once per database, under the migration's lock.
+
+        Carries its own meta flag rather than riding SCHEMA_VERSION: a version
+        bump would re-run _migrate()'s full rebuild_scripts() on every existing
+        database -- a 7M-row re-aggregate -- to store three integers.
+
+        EXCLUSIVE, like _migrate, because the indexer and the web server both
+        open this file: first comer seeds, the rest block on busy_timeout and
+        then find the flag already set. Readers keep going throughout -- WAL
+        lets them read the pre-backfill snapshot -- so a page load during the
+        backfill waits on nothing and is served the old value rather than an
+        error. The minted-supply scan is the slow part (31s on a 4.6M-block
+        chain), which is why it happens once here and never on a request.
+        """
+        if self.get_meta(STATS_SEEDED_KEY) is not None:
+            return
+        self.conn.execute("BEGIN EXCLUSIVE")
+        try:
+            if self.get_meta(STATS_SEEDED_KEY) is not None:
+                self.conn.commit()
+                return
+            self.recompute_stats()
+            self.set_meta(STATS_SEEDED_KEY, "1")
+            self.conn.commit()
+        except BaseException:
+            self.conn.rollback()
+            raise
 
     def script_balances(self, script_hash):
         """Return {"confirmed": {...}, "live": {...}} for one script.
