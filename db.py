@@ -323,6 +323,21 @@ class DB:
                  busy_timeout=None):
         self._in_bulk = False
         self.conn = sqlite3.connect(path, check_same_thread=check_same_thread)
+        try:
+            self._open(schema, busy_timeout)
+        except BaseException:
+            # Everything past sqlite3.connect can raise -- a pragma, or a
+            # migration that fails partway, which is _migrate_spent_mask's
+            # designed case. When it does, __init__ raises and the caller never
+            # gets the object, so it has no handle to close the connection with:
+            # leaving it to the collector is what makes a failed migration
+            # announce itself as an unclosed database rather than as the
+            # migration failure it is. Close it here, so the only thing the
+            # caller sees is the error.
+            self.conn.close()
+            raise
+
+    def _open(self, schema, busy_timeout):
         self.conn.execute("PRAGMA journal_mode=WAL")
         self.conn.execute("PRAGMA synchronous=NORMAL")
         self.conn.execute("PRAGMA cache_size=-%d" % self.CACHE_SIZE_KIB)

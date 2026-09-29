@@ -933,6 +933,36 @@ class SpentMaskMigrationTest(DBTestCase):
                 "SELECT name FROM sqlite_master WHERE type='index'"
                 " AND tbl_name='addr_out'")])
 
+    def test_a_failed_open_closes_the_connection_it_cannot_return(self):
+        # A constructor that raises never hands back the object holding the
+        # connection, so nothing downstream can close it. Covered here because
+        # the failure is otherwise only visible as a ResourceWarning, which a
+        # normal run does not surface and so lets the gap sit unnoticed.
+        #
+        # The failure is injected at _migrate because that is the shape that
+        # matters and the one the constructor cannot recover from by itself: a
+        # path that cannot be opened fails inside sqlite3.connect, before there
+        # is a connection to leak.
+        opened = []
+        real_connect = sqlite3.connect
+
+        def spy(*a, **kw):
+            conn = real_connect(*a, **kw)
+            opened.append(conn)
+            return conn
+
+        path = os.path.join(self._new_dir(), "test.db")
+        with mock.patch.object(db_module.sqlite3, "connect", spy), \
+             mock.patch.object(DB, "_migrate",
+                               side_effect=sqlite3.OperationalError("boom")):
+            with self.assertRaises(sqlite3.OperationalError):
+                DB(path)
+        self.assertEqual(len(opened), 1)
+        # A closed connection refuses work, which is how this is asked without
+        # depending on the warning the fix exists to prevent.
+        with self.assertRaises(sqlite3.ProgrammingError):
+            opened[0].execute("SELECT 1")
+
 
 class MigrationTest(DBTestCase):
     def _demote_to_v2(self, n_txs=3):
