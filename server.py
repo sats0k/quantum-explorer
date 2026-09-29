@@ -287,11 +287,17 @@ class Explorer:
         # twice for the two purposes; is_spent is live (a mempool spend sets it),
         # so per-output status is reported as both readings rather than one
         # "spent" flag.
+        #
+        # Orphaned txs are excluded: the txs list is current history, and no
+        # other endpoint counts an orphan anywhere. Reorgs already sever an
+        # orphan's vin rows (db._clear_from), so the join could not see one
+        # anyway -- the status filter states the contract here rather than
+        # leaning on that data-layer detail alone.
         spends = self.db.query(
             "SELECT i.txid, i.prev_txid, i.prev_vout, t.status FROM vin i"
             " JOIN txs t ON t.txid = i.txid"
             " JOIN addr_out a ON a.txid = i.prev_txid AND a.n = i.prev_vout"
-            " WHERE a.address=?", (addr,))
+            " WHERE a.address=? AND t.status != 'orphaned'", (addr,))
         spend_txids = set()
         spent_confirmed = set()
         for txid, prev_txid, prev_vout, status in spends:

@@ -1156,6 +1156,52 @@ class ReorgSpentFlagTest(DBTestCase):
         self.assertEqual(self.is_spent("T01", 0), False)
 
 
+class OrphanTxHistoryTest(DBTestCase):
+    """/api/address treats orphans as history that no longer is.
+
+    The tx list is current activity, and no other endpoint counts an orphaned
+    tx anywhere (summary excludes them, blocks list only confirmed ones). A
+    reorg already severs an orphan's vin/vout/addr_out rows, so the spend
+    enumeration could never see one via the join -- the status filter states
+    that contract at the query instead of relying on the severing alone.
+    """
+
+    def test_a_real_reorg_leaves_no_orphan_in_the_tx_list(self):
+        self.db.add_tx(tx("A", 100, [("addr0", POKE, 1)], coinbase=True))
+        self.db.add_tx(tx("SPEND", 101, [("addr1", POKE, 2)],
+                          spends=[("A", 0)]))
+        self.db.clear_from(101)                     # orphans SPEND, keeps A
+        self.assertEqual(self.db.query(
+            "SELECT status FROM txs WHERE txid='SPEND'")[0][0], "orphaned",
+            "SPEND survives as a tombstone, not a forgotten row")
+        a = self.explorer.address("addr0")
+        self.assertEqual(self.explorer.address("addr1"), None,
+                         "the orphan's own outputs are gone, so no balance")
+        self.assertIn("A", a["txs"])
+        self.assertNotIn("SPEND", a["txs"],
+                         "an orphaned spend is not active history")
+        self.assertEqual(a["n_txs"], 1)
+        self.assertEqual(a["outputs"][0]["spent"], False,
+                         "the orphaned spend reverts the flag")
+        self.assertEqual(a["outputs"][0]["spent_confirmed"], False)
+
+    def test_an_orphan_left_with_rows_is_still_not_listed(self):
+        # Belt-and-braces: if a data path ever stopped severing an orphan's
+        # rows, the endpoint must still refuse to list it as activity. Forcing
+        # the status directly skips db._clear_from's severing on purpose.
+        self.db.add_tx(tx("A", 100, [("addr0", POKE, 1)], coinbase=True))
+        self.db.add_tx(tx("SPEND", 101, [("addr1", POKE, 2)],
+                          spends=[("A", 0)]))
+        self.db.conn.execute("UPDATE txs SET status='orphaned' WHERE txid=?",
+                             ("SPEND",))
+        self.db.conn.commit()
+        a = self.explorer.address("addr0")
+        self.assertIn("A", a["txs"])
+        self.assertNotIn("SPEND", a["txs"],
+                         "the filter, not the severing, is what keeps it out")
+        self.assertEqual(a["n_txs"], 1)
+
+
 class AddOrderSpentFlagTest(DBTestCase):
     """is_spent must follow the vin table, not the order txs were added in.
 
