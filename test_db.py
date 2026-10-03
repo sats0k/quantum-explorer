@@ -3352,6 +3352,40 @@ class BulkWindowHazardTest(DBTestCase):
         self.assertEqual(self.spent_by("P1", 0), 1)
         self.assertMatchesDerived("after a chained window")
 
+    def test_a_reindex_inside_one_window_counts_the_replacement_not_both(self):
+        # A re-index whose reads see a version other than the one being
+        # replaced overcounts both counters by a whole tx: the "is this new?"
+        # test misses the buffered row, so n_txs is bumped again, and
+        # prev_minted reads nothing, so a replaced coinbase mints twice.
+        # Nothing here has a committed version to read, which is the case the
+        # window itself creates and the only one a test can set up honestly.
+        self.block(1)
+        with self.db.bulk():
+            self.db.add_tx(tx("C1", 1, [("miner", 10 * POKE, 0)], coinbase=True))
+            self.db.add_tx(tx("C1", 1, [("miner", 30 * POKE, 0)], coinbase=True))
+        self.assertEqual(self.db.n_txs(), 1)
+        self.assertEqual(self.db.total_coinbase(), 30 * POKE)
+        self.assertMatchesDerived("after a re-index inside one window")
+
+    def test_a_reindex_that_changes_inputs_frees_the_prevouts_it_dropped(self):
+        # T1 spends A0, then inside one window is re-indexed to spend B0 and
+        # again to spend C0. B0 is held only by the middle version, whose rows
+        # are still buffered when the last version reads what the tx used to
+        # hold -- so B0 never reaches the flag refresh and keeps a spent_by with
+        # no spender behind it, which reads as 10 PXC spent that nothing spends.
+        self.block(1)
+        for name, addr in (("A", "oa"), ("B", "ob"), ("C", "oc")):
+            self.db.add_tx(tx(name, 1, [(addr, 10 * POKE, 0)], coinbase=True))
+        self.db.add_tx(tx("T1", 1, [("p", 1 * POKE, 9)], [("A", 0)]))
+        self.assertEqual(self.spent_by("A"), 1)
+        with self.db.bulk():
+            self.db.add_tx(tx("T1", 1, [("p", 1 * POKE, 9)], [("B", 0)]))
+            self.db.add_tx(tx("T1", 1, [("p", 1 * POKE, 9)], [("C", 0)]))
+        self.assertEqual(self.spent_by("A"), 0, "released by the window")
+        self.assertEqual(self.spent_by("B"), 0, "held only by a buffered version")
+        self.assertEqual(self.spent_by("C"), 1, "spent by the surviving version")
+        self.assertMatchesDerived("after an in-window input change")
+
     def test_a_window_whose_flush_fails_leaves_the_connection_usable(self):
         # The flush can fail on a connection that is otherwise fine -- a
         # lock_timeout or statement_timeout on the meta upsert, a serialization

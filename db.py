@@ -722,7 +722,6 @@ class DB:
                 lineterm="", n=1):
             print("  " + line, flush=True)
 
-
     def _rebuild(self):
         """Throw the database away if it is not the schema this code wants.
 
@@ -1090,12 +1089,10 @@ class DB:
                 if rows:
                     self.conn.executemany(sql, rows)
             return
-        # A txid already buffered in this window: its rows are not in the table
-        # yet, so the SELECTs _add_tx is about to make -- what this txid used to
-        # hold, and whether it is a re-index -- would miss them. Put the window
-        # down first rather than reason about which of the two answers is right.
-        # That flush also writes the version now being replaced, so re-adding
-        # the txid below is what gives the replacement a delete of its own.
+        # A txid already buffered in this window has had the window flushed by
+        # _add_tx before its reads, so `txid in self._buf` cannot be true here;
+        # if it somehow were, the flush below would be too late to help those
+        # reads but still the right thing to do before overwriting the entry.
         if txid in self._buf:
             self._flush_writes()
         self._buf_del.add(txid)
@@ -1109,6 +1106,24 @@ class DB:
             self._add_tx(t)
 
     def _add_tx(self, t):
+        # A txid this window has already buffered: its rows are not in the
+        # table yet, so every SELECT below -- what this txid used to hold,
+        # whether this is a re-index, and what it had already counted into the
+        # supply -- would read the version *before* that one instead of the
+        # version actually being replaced, and take this window's accounting
+        # from the wrong row. The stale answer is not a small one: `released`
+        # comes back holding prevouts the replaced version never spent, so an
+        # output it alone was spending keeps a spent flag with no spender left,
+        # and prev_minted/prev come back as if the row were new, overcounting
+        # n_txs and the coinbase supply by one whole tx.
+        #
+        # Put the window down first, so the reads see what they are about to
+        # replace. This has to happen *here* and not in _write_rows: _write_rows
+        # runs after the reads, so a flush there leaves every one of them
+        # looking at a stale version. The flush also writes the version being
+        # replaced, which is what gives the replacement a delete of its own.
+        if self._buf is not None and t.txid in self._buf:
+            self._flush_writes()
         # Prevouts a previous version of this tx held, read before its vin rows
         # go away. A re-index spends the same set (a txid pins its content), so
         # this is normally empty -- but a changed set must not leave the old
