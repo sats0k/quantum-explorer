@@ -8,7 +8,12 @@
 set -euo pipefail
 
 DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-DB="${DB:-explorer.db}"
+# A libpq connection string or URI, passed straight to psycopg. This used to be
+# a SQLite filename; the explorer now keeps its index in PostgreSQL and the
+# argument is the DSN rather than a path. Override with DB= if your database
+# needs credentials, a socket directory or a non-default port:
+#   DB='postgresql://explorer@/explorer?host=/run/postgresql' ./explorer.sh start
+DB="${DB:-dbname=explorer}"
 RPCUSER="${RPCUSER:-user}"
 RPCPASSWORD="${RPCPASSWORD:-pass}"
 RPCHOST="${RPCHOST:-127.0.0.1}"

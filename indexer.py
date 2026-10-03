@@ -2,25 +2,29 @@
 
 Walks the daemon's JSON-RPC from height 0 to the tip, resolving every
 txid through verbose getrawtransaction and storing the (already decoded
-by the daemon) script types/addresses into SQLite. Re-runs pick up where
-it stopped; the mempool is refreshed each cycle.
+by the daemon) script types/addresses into PostgreSQL. Re-runs pick up
+where it stopped; the mempool is refreshed each cycle.
 
 Usage:
-    python3 indexer.py [db-path] --rpcuser U --rpcpassword P [--host H] [--port N]
+    python3 indexer.py [dsn] --rpcuser U --rpcpassword P [--host H] [--port N]
+
+`dsn` is a libpq connection string (see the libpq docs); it defaults to
+$EXPLORER_DSN, then to "dbname=explorer".
 """
 
 import argparse
 import collections
 import signal
-import sqlite3
 import sys
 import threading
 import time
 
 from decimal import Decimal
 
+import psycopg
+
 from rpc import CallError, RPC, RPCError
-from db import DB, COIN
+from db import DB, COIN, DEFAULT_DSN
 
 TX_TYPES_WITH_ADDRESSES = {
     "pubkey", "pubkeyhash", "scripthash", "hybrid_pubkey",
@@ -73,7 +77,7 @@ class Block:
         self.bits = j.get("bits")
         # RPC decoding uses parse_float=Decimal so amounts stay exact (see
         # amount_to_pokes), which means this genuinely-fractional field arrives
-        # as a Decimal too. sqlite3 cannot bind one, so it is converted here --
+        # as a Decimal too. The driver cannot bind one, so it is converted here --
         # the only non-integer numeric stored anywhere, into a REAL column.
         d = j.get("difficulty")
         self.difficulty = float(d) if d is not None else None
@@ -399,7 +403,7 @@ class Indexer:
             try:
                 self.run_once()
                 backoff = interval
-            except (RPCError, sqlite3.Error) as e:
+            except (RPCError, psycopg.Error) as e:
                 print("transient error: %s (retrying in %.1fs)" % (e, backoff))
                 if self._stop.wait(backoff):
                     break
@@ -416,7 +420,7 @@ class Indexer:
 
 def main():
     p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument("db", nargs="?", default="explorer.db")
+    p.add_argument("dsn", nargs="?", default=DEFAULT_DSN)
     p.add_argument("--host", default="127.0.0.1")
     p.add_argument("--port", type=int, default=9554)
     p.add_argument("--rpcuser", default="")
@@ -427,7 +431,12 @@ def main():
     args = p.parse_args()
 
     rpc = RPC(args.host, args.port, args.rpcuser, args.rpcpassword)
-    db = DB(args.db)
+    # rebuild=True is what makes this process the only one that can throw the
+    # database away: if the schema on disk is not the one this code wants, the
+    # chain is discarded and re-synced from genesis rather than migrated in
+    # place. The web server opens without it and therefore can never trigger
+    # that on a live site.
+    db = DB.initialize(args.dsn, rebuild=True)
     idx = Indexer(db, rpc)
 
     # Surface SIGTERM/SIGINT as a clean stop at the next transaction

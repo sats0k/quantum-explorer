@@ -1,16 +1,38 @@
-"""SQLite storage for the PhoenixCoin Quantum explorer.
+"""PostgreSQL storage for the PhoenixCoin Quantum explorer.
 
 Amounts are stored as integers in "pokes" (COIN = 1e8), matching
 src/util.h. Script types / addresses come verbatim from the daemon's
 verbose getrawtransaction output, which already understands the hybrid
 script templates and hybrid address prefixes.
+
+Everything the rest of the explorer needs is reached through DB, which
+wraps a single psycopg connection. Two deliberate choices are worth
+knowing before reading the SQL below:
+
+* Statements are written with '?' placeholders and rewritten to psycopg's
+  '%s' by _bind, in one place. The SQL therefore reads the same as it did
+  under sqlite3 and nothing outside this module knows which driver is
+  underneath.
+
+* Every SUM is cast back to bigint. Postgres sums bigint into NUMERIC and
+  hands the driver a Decimal, which would make a supply figure a Decimal
+  all the way to json.dumps() -- where it raises. The cast keeps every
+  amount a Python int, which is what the rest of the code assumes.
 """
 
 import hashlib
 import json
-import sqlite3
+import os
+import re
+
+import psycopg
 
 COIN = 100000000
+
+# Connection string used when the command line does not name one. An
+# environment variable rather than a built-in password, so a deployment can
+# point both processes at the same database without it in the source.
+DEFAULT_DSN = os.environ.get("EXPLORER_DSN", "dbname=explorer")
 
 
 def script_hash_of(script_hex):
@@ -22,6 +44,142 @@ def script_hash_of(script_hex):
     return hashlib.new("ripemd160", hashlib.sha256(b).digest()).hexdigest()
 
 
+def _bind(sql):
+    """Rewrite qmark placeholders as the driver's format placeholders.
+
+    '%' is escaped first: psycopg reads a '%' as the start of a
+    placeholder, so a literal one (a LIKE pattern, say) would otherwise be
+    a syntax error. No statement here has one -- every '%' in this module
+    is consumed by Python-side % formatting before it gets here -- but
+    escaping keeps that a property of the SQL rather than a rule every
+    future statement has to remember.
+    """
+    return sql.replace("%", "%%").replace("?", "%s")
+
+
+def _quote_ident(name):
+    """Quote `name` as an SQL identifier.
+
+    For the one statement whose table names are not literal in the source: the
+    rebuild drop, which is built by joining names. A parameter cannot be used
+    there -- parameters are values, and a table name in a DROP is a name -- so
+    it is quoted here, embedded double quotes doubled.
+    """
+    return '"%s"' % name.replace('"', '""')
+
+
+class _PgConn:
+    """A psycopg connection with the transaction discipline db.py expects.
+
+    The connection runs in autocommit so that BEGIN/COMMIT are explicit and
+    the nesting rules are ours rather than the driver's. psycopg's own
+    commit()/rollback() are unconditional server commands -- in autocommit
+    with nothing open, the server answers a warning on every one -- so the
+    open/closed state is tracked here and a stray commit is a no-op, the
+    way it was against sqlite3.
+
+    `with conn:` means "be in a transaction, and commit it on the way out".
+    If one is already open it is left open and committed, which is what
+    sqlite3's `with conn:` did and what set_meta() below relies on: it
+    commits the caller's transaction, which is why the write paths that
+    must not do that use a bare execute().
+    """
+
+    def __init__(self, dsn):
+        self._c = psycopg.connect(dsn, autocommit=True)
+        self._in_tx = False
+        self._trace = None
+
+    def execute(self, sql, params=()):
+        self._trace_sql(sql)
+        return self._c.execute(_bind(sql), params)
+
+    def executemany(self, sql, params):
+        # executemany() is a cursor method in psycopg3, not a connection one,
+        # unlike sqlite3 where both lived on the connection.
+        self._trace_sql(sql)
+        with self._c.cursor() as cur:
+            return cur.executemany(_bind(sql), params)
+
+    def copy_from(self, sql, rows):
+        """COPY `rows` in with the server-side COPY protocol. Returns the count.
+
+        Takes the statement already built (COPY has no placeholders) so the
+        one-off bulk loader can stream a whole
+        chain through here without reaching past this class into the driver.
+        """
+        self._trace_sql(sql)
+        n = 0
+        with self._c.cursor() as cur:
+            with cur.copy(sql) as cp:
+                for row in rows:
+                    cp.write_row(row)
+                    n += 1
+        return n
+
+    def begin(self):
+        """Open a transaction. Raises if one is already open."""
+        if self._in_tx:
+            raise psycopg.ProgrammingError(
+                "a transaction is already open on this connection")
+        self._c.execute("BEGIN")
+        self._in_tx = True
+
+    def commit(self):
+        if self._in_tx:
+            self._c.commit()
+            self._in_tx = False
+
+    def rollback(self):
+        if self._in_tx:
+            self._c.rollback()
+            self._in_tx = False
+
+    def in_transaction(self):
+        return self._in_tx
+
+    def __enter__(self):
+        if not self._in_tx:
+            self.begin()
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        if exc_type is None:
+            self.commit()
+        else:
+            self.rollback()
+        return False
+
+    def set_trace_callback(self, callback):
+        """Send the SQL of every statement issued here to `callback`, or None.
+
+        Recorded in this wrapper rather than taken from the driver's logging,
+        because psycopg does not log statement text at all -- the first version
+        of this shim subscribed to the "psycopg.sql" logger and never fired, so
+        the one test that counts statements was asserting on an empty list and
+        could not fail. What is counted is what goes over the connection from
+        here, which is the number that actually costs a round trip.
+
+        executemany() counts once, not once per row: psycopg pipelines it into
+        a single round trip, and the chunking tests are about round trips.
+        """
+        self._trace = callback
+
+    def _trace_sql(self, sql):
+        if self._trace is not None:
+            self._trace(sql)
+
+    def close(self):
+        self._trace = None
+        # Never leave a transaction open on the way out: an open one holds
+        # row locks and a snapshot until the session ends.
+        try:
+            self.rollback()
+        except psycopg.Error:
+            pass
+        self._c.close()
+
+
 class _Bulk:
     """One big transaction opened on the DB connection."""
 
@@ -31,158 +189,253 @@ class _Bulk:
     def __enter__(self):
         db = self.db
         assert not db._in_bulk
-        db.conn.execute("BEGIN")
+        # Explicit, and so an error if something is already open: a bulk
+        # block nested inside another transaction would commit the outer one
+        # at its own boundary.
+        db.conn.begin()
         db._in_bulk = True
-        return self.db
+        db._buf = {}
+        db._buf_del = set()
+        db._buf_flags = []
+        db._buf_bumps = {}
+        return db
 
     def __exit__(self, exc_type, exc, tb):
         db = self.db
         db._in_bulk = False
         if exc_type is None:
+            # Before the commit, deliberately: the buffered rows and the
+            # counters describing them are part of this transaction, and a
+            # commit that left them unwritten would persist a window of blocks
+            # with no rows in it and counts that match nothing.
+            db._flush_writes()
             db.conn.commit()
         else:
+            db._discard_writes()
             db.conn.rollback()
         return False
 
-SCHEMA = """
-CREATE TABLE IF NOT EXISTS meta (
-    key   TEXT PRIMARY KEY,
-    value TEXT
-);
 
-CREATE TABLE IF NOT EXISTS blocks (
-    height     INTEGER PRIMARY KEY,
-    hash       TEXT UNIQUE NOT NULL,
-    version    INTEGER,
-    merkleroot TEXT,
-    time       INTEGER,
-    nonce      INTEGER,
-    bits       TEXT,
-    difficulty REAL,
-    size       INTEGER,
-    prev_hash  TEXT,
-    next_hash  TEXT
-);
+# Identifiers are quoted throughout and carry COLLATE "C". Postgres would
+# otherwise order text by the database's locale, so the same rows could sort
+# differently on a different server -- txid ordering drives /api/address's
+# output list and /api/mempool's, and "C" makes that order the same
+# bytewise comparison sqlite3's BINARY collation gave.
+SCHEMA = (
+    """
+CREATE TABLE IF NOT EXISTS "meta" (
+    "key"   TEXT COLLATE "C" PRIMARY KEY,
+    "value" TEXT
+)
+""",
+    """
+CREATE TABLE IF NOT EXISTS "blocks" (
+    "height"     BIGINT PRIMARY KEY,
+    "hash"       TEXT COLLATE "C" UNIQUE NOT NULL,
+    "version"    BIGINT,
+    "merkleroot" TEXT COLLATE "C",
+    "time"       BIGINT,
+    "nonce"      BIGINT,
+    "bits"       TEXT COLLATE "C",
+    "difficulty" DOUBLE PRECISION,
+    "size"       BIGINT,
+    "prev_hash"  TEXT COLLATE "C",
+    "next_hash"  TEXT COLLATE "C"
+)
+""",
+    """
+CREATE TABLE IF NOT EXISTS "txs" (
+    "txid"        TEXT COLLATE "C" PRIMARY KEY,
+    "height"      BIGINT,          -- NULL while unconfirmed (mempool)
+    "tx_index"    BIGINT,
+    "version"     BIGINT,
+    "locktime"    BIGINT,
+    "size"        BIGINT,
+    "is_coinbase" INTEGER,
+    "status"      TEXT COLLATE "C" -- 'confirmed' | 'mempool' | 'orphaned'
+)
+""",
+    """
+CREATE TABLE IF NOT EXISTS "vin" (
+    "txid"       TEXT COLLATE "C",
+    "n"          BIGINT,
+    "prev_txid"  TEXT COLLATE "C",   -- NULL for coinbase
+    "prev_vout"  BIGINT,            -- NULL for coinbase
+    "coinbase"   TEXT COLLATE "C",   -- hex, NULL unless coinbase
+    "script_asm" TEXT COLLATE "C",
+    "script_hex" TEXT COLLATE "C",
+    "sequence"   BIGINT,
+    PRIMARY KEY ("txid", "n")
+)
+""",
+    # `mempool` and `spent_by` are denormalized facts about a row, not
+    # accounting. Both are the answer to a question the balance queries used
+    # to re-derive per output, which is what made a busy address take 41s.
+    #
+    # `mempool` is 1 while the owning tx is unconfirmed. It is set from the
+    # inserting tx's height and never revisited: orphaned rows are DELETED
+    # rather than flagged (see _clear_from), so "not confirmed" only ever
+    # means mempool, and a row's owner cannot change status without the row
+    # being rewritten. Which means the owner-side status join the balance
+    # queries used to do is answerable from this bit.
+    #
+    # `spent_by` is a bitmask over the spender's status, and it is what
+    # replaces the per-output EXISTS that dominated both lookups:
+    #     0 = unspent, 1 = spent by a confirmed tx, 2 = by a mempool tx,
+    #     3 = by both.  So `spent_by & 1` is "a confirmed tx spends this" and
+    #     `spent_by & 3` is "any known tx spends this" (the old is_spent
+    #     column). Two bits rather than one because the two balance views
+    #     disagree about the spender as well as the owner: an output spent
+    #     only by a mempool tx is confirmed-unspent, because a mempool spend
+    #     can still evaporate.
+    """
+CREATE TABLE IF NOT EXISTS "vout" (
+    "txid"       TEXT COLLATE "C",
+    "n"          BIGINT,
+    "value"      BIGINT,          -- in pokes (COIN = 1e8)
+    "type"       TEXT COLLATE "C", -- pubkeyhash / scripthash / hybrid_... /
+    "addresses"  TEXT COLLATE "C", -- JSON array of addresses (incl. hybrid)
+    "req_sigs"   INTEGER,
+    "script_asm" TEXT COLLATE "C",
+    "script_hex" TEXT COLLATE "C",
+    "script_hash" TEXT COLLATE "C",
+    "mempool"    INTEGER NOT NULL DEFAULT 0,
+    "spent_by"   INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY ("txid", "n")
+)
+""",
+    """
+CREATE TABLE IF NOT EXISTS "addr_out" (
+    "address" TEXT COLLATE "C",
+    "txid"    TEXT COLLATE "C",
+    "n"       BIGINT,
+    "value"   BIGINT,
+    "type"    TEXT COLLATE "C",
+    "mempool"  INTEGER NOT NULL DEFAULT 0,
+    "spent_by" INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY ("address", "txid", "n")
+)
+""",
+    # Balances are deliberately NOT columns on scripts: they are derived per
+    # request from vout/vin so that the confirmed and mempool-inclusive views
+    # can both be computed exactly (see DB.script_balances).
+    """
+CREATE TABLE IF NOT EXISTS "scripts" (
+    "script_hash"    TEXT COLLATE "C" PRIMARY KEY,
+    "type"           TEXT COLLATE "C",  -- daemon classification
+    "req_sigs"       INTEGER,
+    "addresses"      TEXT COLLATE "C",  -- JSON array of owning addresses
+    "created_height" BIGINT,            -- earliest confirmed height, or NULL
+    "last_height"    BIGINT             -- latest confirmed height, or NULL
+)
+""",
+    # Every index follows every table, so this whole tuple is the one and only
+    # definition of the schema: a database is either built from all of it or
+    # rebuilt from scratch (see DB.initialize). Nothing is ever added to an
+    # existing table, which is why no DDL here has to tolerate a column that
+    # may not exist yet.
 
-CREATE TABLE IF NOT EXISTS txs (
-    txid        TEXT PRIMARY KEY,
-    height      INTEGER,          -- NULL while unconfirmed (mempool)
-    tx_index    INTEGER,
-    version     INTEGER,
-    locktime    INTEGER,
-    size        INTEGER,
-    is_coinbase INTEGER,
-    status      TEXT              -- 'confirmed' | 'mempool' | 'orphaned'
-);
+    'CREATE INDEX IF NOT EXISTS idx_addr_out_txid_n ON addr_out("txid", "n")',
+    'CREATE INDEX IF NOT EXISTS idx_txs_height ON txs("height")',
+    'CREATE INDEX IF NOT EXISTS idx_vin_prev ON vin("prev_txid", "prev_vout")',
+    'CREATE INDEX IF NOT EXISTS idx_scripts_type ON scripts("type")',
 
-CREATE TABLE IF NOT EXISTS vin (
-    txid       TEXT,
-    n          INTEGER,
-    prev_txid  TEXT,              -- NULL for coinbase
-    prev_vout  INTEGER,           -- NULL for coinbase
-    coinbase   TEXT,              -- hex, NULL unless coinbase
-    script_asm TEXT,
-    script_hex TEXT,
-    sequence   INTEGER,
-    PRIMARY KEY (txid, n)
-);
+    # The two covering indexes for the balance lookups, which lead with `value`:
+    # the balance queries sum value over every output of one address/script,
+    # and without it in the index each of those rows costs a separate lookup
+    # into the table to fetch it. The trailing (txid, n) serves the address
+    # page's spender enumeration, which otherwise has to revisit each of those
+    # rows in the table.
+    #
+    # One index each, not a confirmed/mempool pair: a partial index would only
+    # help the confirmed view, and with an empty mempool it would cover almost
+    # every row anyway, so it would nearly double the write cost to save a
+    # comparison on an index-only scan that is already sequential.
+    #
+    # No index on addr_out(address) alone: the primary key is
+    # (address, txid, n), so its unique index already answers WHERE address=?
+    # as a prefix seek, and idx_addr_out_addr answers it covering. The one on
+    # (txid, n) is not redundant, because address leads the key and the primary
+    # key cannot seek past it.
+    #
+    # No index on vout(addresses): it holds a JSON array and nothing filters on
+    # it. Address accounting runs off addr_out, and multisig money is tracked
+    # per script, so there is no lookup this could serve.
+    "CREATE INDEX IF NOT EXISTS idx_addr_out_addr ON addr_out"
+    "(address, value, spent_by, mempool, txid, n)",
+    "CREATE INDEX IF NOT EXISTS idx_vout_script ON vout"
+    "(script_hash, value, spent_by, mempool, txid, n)",
+)
 
--- `mempool` and `spent_by` are denormalized facts about a row, not accounting.
--- Both are the answer to a question the balance queries used to re-derive per
--- output, which is what made a busy address take 41s (see _migrate_spent_mask).
---
--- `mempool` is 1 while the owning tx is unconfirmed. It is set from the
--- inserting tx's height and never revisited: orphaned rows are DELETED rather
--- than flagged (see _clear_from), so "not confirmed" only ever means mempool,
--- and a row's owner cannot change status without the row being rewritten.
--- Which means the owner-side status join the balance queries used to do is
--- answerable from this bit.
---
--- `spent_by` is a bitmask over the spender's status, and it is what replaces
--- the per-output EXISTS that dominated both lookups:
---     0 = unspent, 1 = spent by a confirmed tx, 2 = by a mempool tx,
---     3 = by both.  So `spent_by & 1` is "a confirmed tx spends this" and
--- `spent_by & 3` is "any known tx spends this" (the old is_spent column).
--- Two bits rather than one because the two balance views disagree about the
--- spender as well as the owner: an output spent only by a mempool tx is
--- confirmed-unspent, because a mempool spend can still evaporate.
-CREATE TABLE IF NOT EXISTS vout (
-    txid       TEXT,
-    n          INTEGER,
-    value      INTEGER,           -- in pokes (COIN = 1e8)
-    type       TEXT,              -- e.g. pubkeyhash / scripthash / hybrid_pubkeyhash / ...
-    addresses  TEXT,              -- JSON array of addresses (may include hybrid)
-    req_sigs   INTEGER,
-    script_asm TEXT,
-    script_hex TEXT,
-    script_hash TEXT,
-    mempool    INTEGER NOT NULL DEFAULT 0,
-    spent_by   INTEGER NOT NULL DEFAULT 0,
-    PRIMARY KEY (txid, n)
-);
+# Every index the schema creates, as its DDL, so the bulk loader can drop them
+# all before a COPY and put them back after rather than paying to maintain them
+# row by row across a whole chain. Derived from SCHEMA by filtering rather than
+# written out, because a hand-maintained list drifts: this one listed three of
+# the six, and the loader silently came back with an addr_out missing its
+# (txid, n) index and the whole reorg path unindexed.
+#
+# Not included: the UNIQUE constraints declared inside the blocks and txs
+# CREATE TABLEs (blocks_hash_key, idx_txs_status_height). Those belong to their
+# tables and cannot be dropped without dropping the table, which is why the
+# loader empties with TRUNCATE rather than DROP.
+ALL_INDEXES = tuple(
+    stmt for stmt in SCHEMA
+    if stmt.lstrip().upper().startswith("CREATE INDEX")
+)
 
-CREATE TABLE IF NOT EXISTS addr_out (
-    address TEXT,
-    txid    TEXT,
-    n       INTEGER,
-    value   INTEGER,
-    type    TEXT,
-    mempool  INTEGER NOT NULL DEFAULT 0,
-    spent_by INTEGER NOT NULL DEFAULT 0,
-    PRIMARY KEY (address, txid, n)
-);
+# The tables this schema owns, for DB._rebuild to drop. Derived the same way
+# from the same DDL rather than listed again, so a table added to SCHEMA is
+# dropped on the next rebuild without anyone remembering to name it here -- a
+# missed name would leave the old table in place and let the recreate fail on
+# the duplicate.
+SCHEMA_TABLES = tuple(
+    m.group(1) for stmt in SCHEMA
+    for m in [re.search(r'CREATE TABLE IF NOT EXISTS "(\w+)"', stmt)] if m)
 
--- Covering indexes for the two balance lookups are created by
--- _migrate_spent_mask, not here. `value` is the reason they lead with it: the
--- balance queries sum value over every output of one address/script, and
--- without it in the index each of those rows costs a separate lookup into the
--- table to fetch it -- 3.7s for the 510k-output address, against 0.4us/row for
--- a bare scan of the same rows. The trailing (txid, n) serves the address
--- page's spender enumeration, which otherwise has to revisit each of those
--- rows in the table.
---
--- One index each, not a confirmed/mempool pair: a partial index would only
--- help the confirmed view, and with an empty mempool it would cover almost
--- every row anyway, so it would nearly double the write cost to save a
--- comparison on an index-only scan that is already sequential.
---
--- Not in SCHEMA because SCHEMA is executed before any migration, so naming a
--- column here would fail on exactly the databases that need adding it.
+# What identifies "this schema" for DB.initialize. Derived from SCHEMA rather
+# than hand-written, so editing the DDL is enough to make every existing
+# database rebuild -- there is no separate version number to forget to bump.
+# Normalised to strip whitespace so a reindented comment block is not
+# mistaken for a schema change and does not throw away a good chain.
+SCHEMA_FINGERPRINT = hashlib.sha256(
+    "\n".join(" ".join(s.split()) for s in SCHEMA).encode()).hexdigest()[:16]
 
--- No index on addr_out(address) alone: the primary key is (address, txid, n),
--- so its autoindex already answers WHERE address=? as a prefix seek, and
--- idx_addr_out_addr answers it covering. The one on
--- (txid, n) is not redundant, because address leads the key and the primary
--- key cannot seek past it.
-CREATE INDEX IF NOT EXISTS idx_addr_out_txid_n ON addr_out(txid, n);
--- No index on vout(addresses): it holds a JSON array and nothing filters on it.
--- Address accounting runs off addr_out, and multisig money is tracked per
--- script, so there is no lookup this could serve. See _drop_redundant_indexes.
-CREATE INDEX IF NOT EXISTS idx_txs_height ON txs(height);
-CREATE INDEX IF NOT EXISTS idx_vin_prev ON vin(prev_txid, prev_vout);
-"""
-
-# Declared apart from SCHEMA because the v3 migration has to recreate the table
-# for existing databases. Balances are deliberately NOT columns: they are
-# derived per request from vout/vin so that the confirmed and mempool-inclusive
-# views can both be computed exactly (see DB.script_balances).
-SCRIPTS_TABLE = """
-CREATE TABLE IF NOT EXISTS scripts (
-    script_hash    TEXT PRIMARY KEY,
-    type           TEXT,          -- daemon classification for this template
-    req_sigs       INTEGER,
-    addresses      TEXT,          -- JSON array of addresses that OWN this script
-    created_height INTEGER,       -- earliest confirmed output height, or NULL
-    last_height    INTEGER        -- latest confirmed output height, or NULL
-);
-"""
-
-SCRIPTS_INDEX = "CREATE INDEX IF NOT EXISTS idx_scripts_type ON scripts(type);"
-
-SCHEMA += SCRIPTS_TABLE + "\n" + SCRIPTS_INDEX
+FINGERPRINT_KEY = "schema_fingerprint"
 
 
 ORPHAN_RETENTION = 20000  # tombstones kept this many blocks before pruning
+
+# The row INSERTs, hoisted out of the per-tx method so that a buffered bulk
+# window can hold them alongside the rows they will eventually write. Same text
+# as they always were; only the number of round trips changed.
+SQL_INSERT_TXS = """INSERT INTO txs
+       (txid, height, tx_index, version, locktime, size,
+        is_coinbase, status)
+       VALUES (?,?,?,?,?,?,?,?)"""
+
+SQL_INSERT_VIN = """INSERT INTO vin
+       (txid, n, prev_txid, prev_vout, coinbase,
+        script_asm, script_hex, sequence)
+       VALUES (?,?,?,?,?,?,?,?)"""
+
+SQL_INSERT_VOUT = """INSERT INTO vout
+       (txid, n, value, type, addresses, req_sigs,
+        script_asm, script_hex, script_hash, mempool)
+       VALUES (?,?,?,?,?,?,?,?,?,?)"""
+
+SQL_INSERT_ADDR_OUT = """INSERT INTO addr_out
+       (address, txid, n, value, type, mempool)
+       VALUES (?,?,?,?,?,?)"""
+
+SQL_INSERT_SCRIPTS = """INSERT INTO scripts
+       (script_hash, type, req_sigs, addresses,
+        created_height, last_height)
+       VALUES (?,?,?,?,?,?)
+       ON CONFLICT(script_hash) DO UPDATE SET
+         created_height = LEAST(scripts.created_height,
+                                EXCLUDED.created_height),
+         last_height = GREATEST(scripts.last_height,
+                                EXCLUDED.last_height)"""
 
 # Cumulative minted supply: every coinbase output ever indexed. This is NOT
 # "outstanding/unspent" -- it is never decremented by spends.
@@ -195,17 +448,20 @@ ORPHAN_RETENTION = 20000  # tombstones kept this many blocks before pruning
 #
 # The status='confirmed' filter is load-bearing, not redundant: a mempool tx
 # is not yet minted, and an orphaned one no longer counts.
+#
+# The ::bigint is load-bearing too: Postgres sums bigint into NUMERIC, and
+# without the cast the driver hands back a Decimal that json.dumps() refuses.
 TOTAL_COINBASE_SQL = (
-    "SELECT COALESCE(SUM(v.value),0) FROM vout v JOIN txs t "
+    "SELECT COALESCE(SUM(v.value)::bigint, 0) FROM vout v JOIN txs t "
     "ON v.txid = t.txid WHERE t.is_coinbase = 1 AND t.status = 'confirmed'")
 
 # The maintained running total. Unlike a balance, minted supply has no
-# mempool/confirmed split to get wrong and no double-spend to net out: it is
-# a plain accumulator over coinbase outputs, and the write path already knows
-# each coinbase tx's output values at insert time. So it is kept in the same
-# transaction as the rows it describes -- a reader takes one indexed meta
-# lookup instead of a 31s scan, and sees the counter and the data from a
-# single consistent snapshot because they commit together.
+# mempool/confirmed split to get wrong and no double-spend to net out: it
+# is a plain accumulator over coinbase outputs, and the write path already
+# knows each coinbase tx's output values at insert time. So it is kept in
+# the same transaction as the rows it describes -- a reader takes one
+# indexed meta lookup instead of a 31s scan, and sees the counter and the
+# data from a single consistent snapshot because they commit together.
 COINBASE_TOTAL_KEY = "total_coinbase"
 N_BLOCKS_KEY = "n_blocks"
 N_TXS_KEY = "n_txs"
@@ -230,382 +486,230 @@ STATS = (
     (N_BLOCKS_KEY, N_BLOCKS_SQL),
     (N_TXS_KEY, N_TXS_SQL),
 )
-STATS_SEEDED_KEY = "stats_seeded"
 
-# Bind parameters per statement, chunked. SQLITE_LIMIT_VARIABLE_NUMBER is
-# compiled in: 999 before SQLite 3.32, 32766 after, 250000 in recent versions.
-# An eviction or a reorg hands us an id list whose size we did not choose, and a
-# statement over the cap does not degrade, it raises -- taking the enclosing
-# transaction with it. A mempool past the cap would then never be cleanable, and
-# a reorg past it would never apply, both forever. 500 fits inside the oldest
-# cap with room to spare.
+# Bind parameters per statement, chunked. Postgres allows 65535 parameters
+# per statement, which is far more than any of these lists reaches, but the
+# cap is a hard error rather than a degradation: an eviction or a reorg hands
+# us an id list whose size we did not choose, and a statement over the cap
+# would take the enclosing transaction with it. A mempool past the cap would
+# then never be cleanable, and a reorg past it would never apply, both
+# forever. 500 keeps the batches cache-friendly and is nowhere near the cap.
+#
+# Read through the module global at call time rather than captured as a
+# default argument, so that patching it actually changes the chunking -- which
+# is how the tests drive real chunking on a server whose own limit is too high
+# to reach.
 SQL_VAR_CHUNK = 500
 
 
-def _chunks(seq, size=SQL_VAR_CHUNK):
+def _chunks(seq, size=None):
     """Yield `seq` in slices of at most `size`, for building IN (...) lists."""
     seq = list(seq)
+    size = SQL_VAR_CHUNK if size is None else size
     for i in range(0, len(seq), size):
         yield seq[i:i + size]
 
 
 class DB:
-    # scripts_v2: scripts.created_height/last_height are confirmed-only, so a
-    # script seen solely in the mempool stores NULL instead of the 1<<31 / -1
-    # sentinels v1 baked in. Bumping this re-runs the (idempotent) migration
-    # and rebuilds scripts, which is what repairs the already-persisted rows.
+    # How long a statement waits for a lock held by another session. The
+    # schema window is generous because it is rare, bounded, and must not fail
+    # halfway; ordinary work waits seconds and then errors, so a caller retries
+    # on its next cycle instead of parking a request thread.
+    NORMAL_LOCK_TIMEOUT_MS = 5000
+    SCHEMA_LOCK_TIMEOUT_MS = 1800000
+
+    # Serializes schema work across sessions (the indexer and the web server
+    # share this database): the first comer builds, the rest block on
+    # lock_timeout and then see the fingerprint already written.
     #
-    # scripts_v3: drops the value_received/value_spent/n_vout/n_spent counter
-    # columns. A single set of counters could not express the confirmed/live
-    # split the API needs, and counting spends per *input* double-counted an
-    # output that two known txs both spend (a mempool conflict drove the
-    # balance negative). Balances are now derived per request from vout/vin,
-    # so the table only holds metadata that cannot be recomputed from the rows.
-    SCHEMA_VERSION = "scripts_v3"
-
-    # How long a statement waits for a lock held by another process. The
-    # migration window is generous because it is rare, bounded, and must not
-    # fail halfway; ordinary work waits seconds and then errors, so a caller
-    # retries on its next cycle instead of parking a request thread.
-    NORMAL_BUSY_TIMEOUT_MS = 5000
-    MIGRATION_BUSY_TIMEOUT_MS = 1800000
-
-    # Per-connection page cache, in KiB (the negative form SQLite uses). The
-    # default is 2000 KiB, which against a 14 GB database means nearly every
-    # page a query touches costs a read() syscall. This is a pool of a few
-    # connections on the web side plus one in the indexer, not one per process
-    # per request, so 64 MiB each is a few hundred MiB in total.
-    CACHE_SIZE_KIB = 65536
-
-    # Bytes of the database a connection reads through mmap instead of
-    # read(). Repeat reads are then served by the OS page cache with no second
-    # copy, and -- the reason it matters most here -- the indexer's
-    # checkpoints no longer have to push pages through this process's own
-    # cache to make them visible to a reader.
-    MMAP_SIZE = 1 << 30
-
-    # Cap on how large the write-ahead log is left after a checkpoint. The
-    # default (-1) never truncates, and a WAL file is reused rather than
-    # shrunk, so its high-water mark is permanent: this database's reached
-    # 33 GB. That was a symptom, not the disease -- a reader holding a
-    # snapshot for 31s (the per-request minted-supply scan) meant no
-    # checkpoint could ever complete, so the log could never be reset at all.
-    # With that fixed the log checkpoints continuously, and this is what turns
-    # "checkpointed" into "reclaims the space": after each checkpoint the file
-    # is truncated back to this size instead of staying at its largest.
-    JOURNAL_SIZE_LIMIT = 64 << 20
+    # Keyed on the schema name so two explorer databases in one server (the
+    # test suite creates one per test) do not queue behind each other. Only
+    # over-serialization, never under: a hash collision would make two
+    # databases wait for each other, which is slower and still correct.
+    SCHEMA_LOCK_SQL = "SELECT pg_advisory_xact_lock(" \
+                      "hashtextextended(current_schema(), 0))"
 
     @classmethod
-    def initialize(cls, path):
-        """Create or migrate the schema, and return a usable connection.
+    def initialize(cls, dsn, rebuild=False):
+        """Build the schema if absent, and return a usable connection.
 
         For the indexer, and for any process that starts cold. Runs DDL, so it
         is the slow path -- once per process, not once per request.
+
+        rebuild=True additionally means "this database may be thrown away if its
+        shape is not the one this code wants". A rebuild is a from-scratch
+        reindex, so only the indexer may ask for one; the web side uses
+        initialize(dsn) and never discards anything. See _rebuild for why the
+        schema is never migrated in place.
         """
-        return cls(path, schema=True)
+        return cls(dsn, schema=True, rebuild=rebuild)
 
     @classmethod
-    def connect(cls, path):
+    def connect(cls, dsn):
         """Open an existing database without touching the schema.
 
-        The read side (the web API) must never run CREATE TABLE or a migration:
-        those are per-process costs, and paying them on every request dominated
-        the handler's own work. The database is expected to exist already --
+        The read side (the web API) must never run CREATE TABLE: those are
+        per-process costs, and paying them on every request dominated the
+        handler's own work. The schema is expected to exist already --
         call initialize() once at startup.
 
-        check_same_thread=False is required because a pooled connection is
-        created once and then used by whichever request thread borrows it; the
-        pool guarantees only one thread holds it at a time.
+        A connection is not bound to the thread that made it, which is what
+        lets the web side pool one set and hand them to request threads.
         """
-        return cls(path, schema=False, check_same_thread=False)
+        return cls(dsn, schema=False)
 
-    def __init__(self, path, schema=True, check_same_thread=True,
-                 busy_timeout=None):
+    def __init__(self, dsn, schema=True, rebuild=False, lock_timeout=None):
         self._in_bulk = False
-        self.conn = sqlite3.connect(path, check_same_thread=check_same_thread)
+        # Bulk-window write buffer. See _flush_writes. All three are None
+        # outside a bulk window, which is what makes "am I buffering?" a single
+        # `is not None` at each write site rather than a flag to keep in step.
+        self._buf = None        # txid -> {table: [rows]} for buffered INSERTs
+        self._buf_del = None    # txids to DELETE, batched into one pass at flush
+        self._buf_flags = None  # (txid, n) pairs awaiting _refresh_spent_flags
+        self._buf_bumps = None  # meta key -> accumulated delta
+        self.conn = _PgConn(dsn)
         try:
-            self._open(schema, busy_timeout)
+            self._open(schema, rebuild, lock_timeout)
         except BaseException:
-            # Everything past sqlite3.connect can raise -- a pragma, or a
-            # migration that fails partway, which is _migrate_spent_mask's
-            # designed case. When it does, __init__ raises and the caller never
-            # gets the object, so it has no handle to close the connection with:
-            # leaving it to the collector is what makes a failed migration
-            # announce itself as an unclosed database rather than as the
-            # migration failure it is. Close it here, so the only thing the
-            # caller sees is the error.
+            # Everything after the connection opens can raise -- a SET, or a
+            # rebuild that fails partway (a full disk, a killed indexer). When
+            # it does, __init__ raises and the caller never gets the object, so
+            # it has no handle to close the connection with: leaving it to the
+            # collector is what makes that failure announce itself as an
+            # unclosed connection rather than as the error it is. Close it
+            # here, so the only thing the caller sees is the error.
             self.conn.close()
             raise
 
-    def _open(self, schema, busy_timeout):
-        self.conn.execute("PRAGMA journal_mode=WAL")
-        self.conn.execute("PRAGMA synchronous=NORMAL")
-        self.conn.execute("PRAGMA cache_size=-%d" % self.CACHE_SIZE_KIB)
-        self.conn.execute("PRAGMA mmap_size=%d" % self.MMAP_SIZE)
-        self.conn.execute("PRAGMA journal_size_limit=%d"
-                          % self.JOURNAL_SIZE_LIMIT)
-        # A migration may hold an EXCLUSIVE lock for minutes (the script_hash
-        # backfill), and the other process opening this same file must wait for
-        # it rather than die on a lock error -- so the long timeout applies to
-        # schema creation and DDL, which must also precede it being lowered.
-        # A connection that never migrates never gets the long timeout at all.
-        self.conn.execute("PRAGMA busy_timeout=%d" % (
-            busy_timeout or (self.MIGRATION_BUSY_TIMEOUT_MS if schema
-                             else self.NORMAL_BUSY_TIMEOUT_MS)))
+    def _open(self, schema, rebuild, lock_timeout):
+        # synchronous_commit=off is the durability/throughput trade SQLite's
+        # synchronous=NORMAL made: a crash can lose recent commits, but the
+        # server does not fsync each one. Every figure on screen is
+        # reconstructible from the chain, and the indexer re-reads it.
+        self.conn.execute("SET synchronous_commit = off")
+        # Building a schema, or throwing one away and rebuilding it, can hold
+        # this advisory lock for a long time. The other process opening this
+        # same database must wait for it rather than die on a lock error -- so
+        # the long timeout applies to schema work, which must also precede it
+        # being lowered. A connection that never builds a schema never gets the
+        # long timeout at all.
+        self.conn.execute("SET lock_timeout = '%dms'" % (
+            lock_timeout or (self.SCHEMA_LOCK_TIMEOUT_MS if schema
+                             else self.NORMAL_LOCK_TIMEOUT_MS)))
         if not schema:
             return
-        self.conn.executescript(SCHEMA)
-        self._migrate()
-        self._backfill_stats()
-        self.conn.commit()
-        # Steady-state work -- indexing, and every web request -- waits only
-        # briefly. A web reader that parks for MIGRATION_BUSY_TIMEOUT_MS turns
-        # one long migration into 50 requests hanging for half an hour; a
-        # blocked caller should fail fast and be retried instead.
-        if busy_timeout is None:
-            self.conn.execute("PRAGMA busy_timeout=%d"
-                              % self.NORMAL_BUSY_TIMEOUT_MS)
-
-    # (index, meta flag) for each index a table's own key or column set already
-    # covers. See _drop_redundant_indexes.
-    REDUNDANT_INDEXES = (
-        ("idx_addr_out_address", "addr_out_address_index"),
-        ("idx_vout_address", "vout_address_index"),
-    )
-
-    def _drop_redundant_indexes(self):
-        """Drop indexes that nothing queries, and that a key already covers.
-
-        * idx_addr_out_address -- addr_out's key is (address, txid, n), so
-          sqlite_autoindex_addr_out_1 answers WHERE address=? as a prefix seek.
-        * idx_vout_address -- a B-tree on a JSON array of addresses, which
-          nothing filters on. It could not serve the substring search that would
-          need it either: matching one address inside '["a","b"]' wants a row
-          per owner, not an index. Per-owner multisig accounting, if it is ever
-          wanted, is a table and not an index.
-
-        Checked by EXPLAIN QUERY PLAN across every query that reads vout or
-        addr_out: none chose either index, and dropping them changed no plan and
-        no read latency (address_balances 19.2 vs 20.6 us). What it saved is
-        1.1 MB and 1.3 MB per 60k rows, and 18% of bulk index write time.
-
-        Carries its own meta flags rather than bumping schema_version: no table
-        changes shape, and a bump would re-run _migrate()'s full
-        rebuild_scripts() on every existing database, which is a lot of work to
-        reclaim an index.
-        """
-        for index, flag in self.REDUNDANT_INDEXES:
-            if self.get_meta(flag) == "dropped":
-                continue
-            self.conn.execute("DROP INDEX IF EXISTS " + index)
-            self.set_meta(flag, "dropped")
-
-    def _migrate(self):
-        self._drop_redundant_indexes()
-        # Ordered, and both unconditional. The version migration has to come
-        # first because the spent-mask migration builds an index on
-        # vout.script_hash, which an older database does not have until the
-        # version migration adds it. Neither is skipped by the other's early
-        # return: each carries its own meta flag, so a database can be on the
-        # current version and still need the columns.
-        if self.get_meta("schema_version") != self.SCHEMA_VERSION:
-            self._migrate_version()
-        self._migrate_spent_mask()
-
-    def _migrate_version(self):
-        # Serialize schema changes across processes (indexer + web open this
-        # same DB): first-comer migrates under EXCLUSIVE, the rest block on
-        # busy_timeout and then see schema_version set.
-        self.conn.execute("BEGIN EXCLUSIVE")
-        try:
-            if self.get_meta("schema_version") == self.SCHEMA_VERSION:
-                self.conn.commit()
-                return
-            cols = [r[1] for r in self.conn.execute("PRAGMA table_info(txs)").fetchall()]
-            if "status" not in cols:
-                self.conn.execute("ALTER TABLE txs ADD COLUMN status TEXT")
-                self.conn.execute(
-                    "UPDATE txs SET status='mempool' WHERE height IS NULL")
-                self.conn.execute(
-                    "UPDATE txs SET status='confirmed' WHERE height IS NOT NULL")
-            self.conn.execute(
-                "CREATE INDEX IF NOT EXISTS idx_txs_status_height "
-                "ON txs(status, height)")
-            vcols = [r[1] for r in self.conn.execute("PRAGMA table_info(vout)").fetchall()]
-            if "script_hash" not in vcols:
-                self.conn.execute("ALTER TABLE vout ADD COLUMN script_hash TEXT")
-            nhash = self.conn.execute(
-                "SELECT COUNT(*) FROM vout WHERE script_hash IS NULL").fetchone()[0]
-            if nhash:
-                rows = self.conn.execute(
-                    "SELECT txid, n, script_hex FROM vout "
-                    "WHERE script_hex IS NOT NULL").fetchall()
-                upd = []
-                for txid, n, hx in rows:
-                    # One hash per row, not two: a comprehension that filters on
-                    # script_hash_of(hx) and also returns it recomputes the
-                    # SHA256+RIPEMD160 for every row that passes the filter.
-                    sh = script_hash_of(hx)
-                    if sh:
-                        upd.append((sh, txid, n))
-                self.conn.executemany(
-                    "UPDATE vout SET script_hash=? WHERE txid=? AND n=?", upd)
-            self.conn.execute(
-                "CREATE INDEX IF NOT EXISTS idx_vout_script_hash "
-                "ON vout(script_hash)")
-            self._migrate_scripts_columns()
-            self.rebuild_scripts()
-            self.set_meta("schema_version", self.SCHEMA_VERSION)
-        except BaseException:
-            self.conn.rollback()
-            raise
-
-    def _migrate_spent_mask(self):
-        """Add mempool/spent_by to addr_out and vout, and backfill them once.
-
-        The balance lookups used to re-derive, per output and per request,
-        two facts the write path already knows: who owns the output, and who
-        spends it. On the busiest address that was 510k txs lookups plus 510k
-        correlated EXISTS into vin, and /api/address took 41s. Both are now
-        columns maintained by _refresh_spent_flags and by the insert, so this
-        migration is what turns the existing rows into that shape.
-
-        Carries its own meta flag rather than riding schema_version: a version
-        bump re-runs the version migration's full rebuild_scripts() -- a
-        re-aggregate over every vout in the chain -- on every existing
-        database, which is a lot of work to add two columns. Same reasoning as
-        _drop_redundant_indexes, except this one does change table shape.
-
-        Carries it in a single transaction, so a database that fails partway
-        through (an interrupted CREATE INDEX, a full disk) is left exactly as
-        it was rather than with the columns added and the values missing --
-        which would read as "every output is unspent" and report a balance of
-        the full supply. The flag is only set on the way out, so the next
-        start retries from the top.
-
-        The backfill is the expensive part: it walks every vin row to work out
-        each output's spender statuses, which is 10M rows on this chain and the
-        only step here that is not a schema edit. It happens once, and it is
-        the reason this migration wants the database to itself rather than
-        sharing it with a live web request.
-        """
-        if self.get_meta("spent_mask") == "1":
-            return
-        self.conn.execute("BEGIN EXCLUSIVE")
-        try:
-            if self.get_meta("spent_mask") == "1":
-                self.conn.commit()
-                return
-            for table in ("addr_out", "vout"):
-                cols = {r[1] for r in
-                        self.conn.execute("PRAGMA table_info(%s)" % table)}
-                if "spent_by" not in cols:
-                    # Both default to 0, which is right for mempool (there are
-                    # no mempool rows on a database being migrated after a
-                    # clean start, and the ones that do exist are fixed below)
-                    # and for spent_by only as a starting point.
-                    self.conn.execute(
-                        "ALTER TABLE %s ADD COLUMN mempool INTEGER "
-                        "NOT NULL DEFAULT 0" % table)
-                    self.conn.execute(
-                        "ALTER TABLE %s ADD COLUMN spent_by INTEGER "
-                        "NOT NULL DEFAULT 0" % table)
-            # mempool: driven from the mempool tx list rather than by scanning
-            # addr_out for rows to change. The list is bounded by the mempool
-            # and the (txid, n) indexes answer it, where the other direction --
-            # one pass over 7M rows to test each -- is the whole cost of the
-            # migration multiplied for nothing.
-            mempool = [r[0] for r in self.conn.execute(
-                "SELECT txid FROM txs WHERE status='mempool'")]
-            for txid in mempool:
-                self.conn.execute(
-                    "UPDATE addr_out SET mempool=1 WHERE txid=?", (txid,))
-                self.conn.execute(
-                    "UPDATE vout SET mempool=1 WHERE txid=?", (txid,))
-            # spent_by, derived from the spenders themselves through a temp
-            # table of (output -> status mask). Keyed on the output, so one
-            # lookup answers it, and built from vin rather than from either
-            # output table, so the unspent rows -- the majority -- cost nothing
-            # to skip.
+        # Postgres has no executescript(): psycopg raises on a multi-statement
+        # execute(). More to the point, DDL is transactional here, so the
+        # whole schema can go in one transaction and a failure leaves no
+        # half-created tables behind -- which the sqlite3 version could not
+        # offer, since executescript() committed as it went.
+        with self.conn:
+            # Serialize the WHOLE schema build, not just a few steps. CREATE
+            # TABLE IF NOT EXISTS is not race-safe in PostgreSQL: the existence
+            # check and the catalog insert are not one atomic act, so two
+            # sessions creating the same table at the same moment can still
+            # collide in pg_type and one of them dies with "duplicate key value
+            # violates unique constraint pg_type_typname_nsp_index" -- IF NOT
+            # EXISTS and all.
             #
-            # One path for both tables, and deliberately not a shortcut for
-            # addr_out's old is_spent column: that column was never on vout, so
-            # a shortcut keyed on it would leave every vout row at the default 0
-            # and every script balance reading as unspent. The vin scan is
-            # needed for vout regardless, so reading is_spent would save nothing
-            # anyway -- it was an optimisation that cost a correctness bug.
-            self.conn.execute(
-                "CREATE TEMP TABLE _sp(txid TEXT, n INTEGER, "
-                "st INTEGER, PRIMARY KEY(txid, n)) WITHOUT ROWID")
-            # Both bits, or the mask is not a mask: an output spent only by a
-            # mempool tx has to come out 2, and one spent by both has to come
-            # out 3. MAX() over a boolean is 1 if any spender has that status,
-            # so the two are independent tests and the mempool one is shifted
-            # into the high bit.
-            self.conn.execute(
-                "INSERT OR REPLACE INTO _sp "
-                "SELECT i.prev_txid, i.prev_vout, "
-                "       MAX(t.status = 'confirmed') "
-                "     | (MAX(t.status = 'mempool') << 1) "
-                "FROM vin i JOIN txs t ON t.txid = i.txid "
-                "WHERE i.prev_txid IS NOT NULL GROUP BY 1, 2")
-            for table in ("addr_out", "vout"):
-                # Restricted to the outputs _sp actually holds: everything else
-                # is unspent, which is what the column was just defaulted to, so
-                # rewriting those rows would be a full pass over the table to
-                # store a value it already has.
-                self.conn.execute(
-                    "UPDATE %s SET spent_by = (SELECT st FROM _sp"
-                    "  WHERE _sp.txid = %s.txid AND _sp.n = %s.n) "
-                    "WHERE (txid, n) IN (SELECT txid, n FROM _sp)"
-                    % (table, table, table))
-            self.conn.execute("DROP TABLE _sp")
-            # is_spent is now spent_by & 3 and nothing reads it, so it goes.
-            # DROP COLUMN is a schema edit rather than a table rewrite for an
-            # unindexed column, which is why it is safe to do on 7M rows here.
-            # Absent on a database created from the current SCHEMA, which never
-            # had it.
-            if "is_spent" in {r[1] for r in self.conn.execute(
-                    "PRAGMA table_info(addr_out)")}:
-                self.conn.execute("ALTER TABLE addr_out DROP COLUMN is_spent")
-            self.conn.execute(
-                "CREATE INDEX IF NOT EXISTS idx_addr_out_addr ON addr_out"
-                "(address, value, spent_by, mempool, txid, n)")
-            self.conn.execute(
-                "CREATE INDEX IF NOT EXISTS idx_vout_script ON vout"
-                "(script_hash, value, spent_by, mempool, txid, n)")
-            # Superseded by idx_vout_script, which leads with the same column
-            # and so answers everything the old one did plus the balance query.
-            self.conn.execute("DROP INDEX IF EXISTS idx_vout_script_hash")
-            self.set_meta("spent_mask", "1")
-            self.conn.commit()
-        except BaseException:
-            self.conn.rollback()
-            raise
+            # That is not hypothetical: on a cold start the indexer and the web
+            # server both call initialize() within a second of each other, the
+            # web server was the one that lost, and it died before binding, so
+            # the site was unreachable until the second run.
+            #
+            # Re-entrant within this transaction, so anything below taking it
+            # again is harmless; it is released at the commit either way.
+            self.conn.execute(self.SCHEMA_LOCK_SQL)
+            # Whether this database was already there. It decides who is allowed
+            # to vouch for the shape, which is the one thing the fingerprint is.
+            existed = self.conn.execute(
+                "SELECT to_regclass('meta') IS NOT NULL").fetchone()[0]
+            if rebuild:
+                self._rebuild()
+            for statement in SCHEMA:
+                self.conn.execute(statement)
+            # Stamp the fingerprint only when this connection can actually
+            # vouch for the shape: either it was asked to rebuild, so it checked
+            # or made it correct, or it built the schema itself just now.
+            #
+            # The read side stamps nothing on a database it merely found. That
+            # matters because the two processes race at startup: if the web
+            # server claimed a pre-existing database as current, the indexer
+            # arriving a moment later would read a matching fingerprint, skip
+            # its rebuild, and the old chain would survive a schema this code
+            # cannot read. A missing fingerprint costs the indexer one rebuild;
+            # a wrong one costs it silently serving the wrong data.
+            if rebuild or not existed:
+                self.set_meta(FINGERPRINT_KEY, SCHEMA_FINGERPRINT)
+        # Steady-state work -- indexing, and every web request -- waits only
+        # briefly. A web reader that parks for SCHEMA_LOCK_TIMEOUT_MS turns one
+        # long build into 50 requests hanging for half an hour; a blocked caller
+        # should fail fast and be retried instead.
+        if lock_timeout is None:
+            self.conn.execute("SET lock_timeout = '%dms'"
+                              % self.NORMAL_LOCK_TIMEOUT_MS)
 
-    def _migrate_scripts_columns(self):
-        """Reshape a v1/v2 scripts table (with counter columns) to v3.
+    def _rebuild(self):
+        """Throw the database away if it is not the schema this code wants.
 
-        Recreate rather than ALTER TABLE ... DROP COLUMN, which needs SQLite
-        3.35+. The counter columns are intentionally not copied: they are
-        derived data and rebuild_scripts() recomputes what still belongs.
-        Discrete execute()s, not executescript(): the latter commits any
-        pending transaction, which would drop the EXCLUSIVE lock this
-        migration is holding.
+        The policy is that the schema is never migrated in place: a shape
+        change costs a from-scratch reindex, which on this chain is a few
+        minutes of wall clock and no downtime. What that buys is the removal of
+        every in-place migration path, and with them the entire class of bugs
+        where a migration left a column present but its values missing. That is
+        not hypothetical either: adding `spent_by` as a column defaulting to 0
+        without backfilling it reads as "nothing is spent", so the balance
+        queries report the entire supply to every address.
+
+        The cost is that a deployment which edits SCHEMA discards its indexed
+        chain. That is the deliberate trade -- it is the one operation here that
+        destroys data, so it is not reachable from the web side, which opens
+        with rebuild=False and can therefore never trigger one.
+
+        Only objects this schema owns are dropped, and meta is the gate: a
+        database that predates the fingerprint (or carries a stale one) is not
+        known to be a shape this code understands, so it is emptied outright
+        rather than inspected for compatibility.
+
+        Nothing is dropped when the fingerprint already matches, which is every
+        start after the first. The indexer re-syncs only when the chain is
+        actually behind, so this is a no-op on a healthy database and a full
+        reindex on a code change.
         """
-        cols = [r[1] for r in
-                self.conn.execute("PRAGMA table_info(scripts)").fetchall()]
-        if "value_received" not in cols:
+        # A database that has no meta table yet has nothing to lose; a database
+        # that does not record its fingerprint predates this policy and cannot
+        # be vouched for. Either way, only ask the question when meta exists.
+        present = self.conn.execute(
+            "SELECT to_regclass('meta') IS NOT NULL").fetchone()[0]
+        if not present:
             return
-        self.conn.execute("ALTER TABLE scripts RENAME TO scripts_v2")
-        self.conn.execute(SCRIPTS_TABLE)
-        self.conn.execute(
-            """INSERT INTO scripts
-               (script_hash, type, req_sigs, addresses)
-               SELECT script_hash, type, req_sigs, addresses FROM scripts_v2""")
-        # Dropping the old table also drops the index that followed it.
-        self.conn.execute("DROP TABLE scripts_v2")
-        self.conn.execute(SCRIPTS_INDEX)
+        if self.get_meta(FINGERPRINT_KEY) == SCHEMA_FINGERPRINT:
+            return
+        # Only tables this schema owns are dropped, and meta is the gate: a
+        # database that predates the fingerprint (or carries a stale one) is not
+        # known to be a shape this code understands, so it is emptied outright
+        # rather than inspected for compatibility.
+        #
+        # DROP TABLE, not TRUNCATE, because this is the from-scratch path and
+        # truncate would leave behind an index the schema no longer declares --
+        # and a leftover index costs write time on every block forever, with
+        # nothing to notice it.
+        #
+        # Qualified with current_schema() rather than left to search_path, and
+        # emphatically not `pg_temp`: that alias names the session's *temp*
+        # schema, so `DROP TABLE IF EXISTS pg_temp."blocks"` finds nothing there
+        # and skips it in silence, which reads as a successful rebuild and
+        # leaves the old chain in place. Dropping by name without CASCADE means
+        # an unexpected dependency surfaces as an error rather than as a
+        # silently deleted object.
+        #
+        # PostgreSQL DDL is transactional, so this and the recreate in the
+        # caller are one atomic step: a failure here leaves the old chain
+        # exactly as it was.
+        schema = self.conn.execute("SELECT current_schema()").fetchone()[0]
+        self.conn.execute("DROP TABLE IF EXISTS %s" % ", ".join(
+            "%s.%s" % (_quote_ident(schema), _quote_ident(t))
+            for t in SCHEMA_TABLES))
 
     def bulk(self):
         """Context manager: wrap many add_block/add_tx in one transaction."""
@@ -621,6 +725,11 @@ class DB:
 
     def clear_from(self, height):
         """Truncate the chain at <height> (reorg support)."""
+        # Write the window out first. A reorg discovered mid-window truncates
+        # everything from here on, and rows still buffered for those very blocks
+        # would be inserted again by the flush at __exit__ -- undoing the
+        # truncation the caller just asked for, inside the same transaction.
+        self._flush_writes()
         if not self._in_bulk:
             with self.conn:
                 self._clear_from(height)
@@ -670,25 +779,30 @@ class DB:
                 # have to walk every vin row sharing the output. The status is
                 # read through txs because a vin row's own status is its
                 # owner's, which is the thing being asked about here.
+                #
+                # The ::bigint on each VALUES row is what gives the CTE its
+                # column types: Postgres infers an undecorated parameter as
+                # text, and n has to come out bigint to compare with the
+                # bigint columns it is matched against.
                 self.conn.execute(
                     """WITH p(txid, n) AS (VALUES %s)
                        UPDATE %s SET spent_by =
                            (CASE WHEN EXISTS (
-                                SELECT 1 FROM vin
-                                JOIN txs ON txs.txid = vin.txid
-                                WHERE vin.prev_txid = %s.txid
-                                  AND vin.prev_vout = %s.n
-                                  AND txs.status = 'confirmed')
-                             THEN 1 ELSE 0 END)
+                                 SELECT 1 FROM vin
+                                 JOIN txs ON txs.txid = vin.txid
+                                 WHERE vin.prev_txid = %s.txid
+                                   AND vin.prev_vout = %s.n
+                                   AND txs.status = 'confirmed')
+                              THEN 1 ELSE 0 END)
                          | (CASE WHEN EXISTS (
-                                SELECT 1 FROM vin
-                                JOIN txs ON txs.txid = vin.txid
-                                WHERE vin.prev_txid = %s.txid
-                                  AND vin.prev_vout = %s.n
-                                  AND txs.status = 'mempool')
-                             THEN 2 ELSE 0 END)
+                                 SELECT 1 FROM vin
+                                 JOIN txs ON txs.txid = vin.txid
+                                 WHERE vin.prev_txid = %s.txid
+                                   AND vin.prev_vout = %s.n
+                                   AND txs.status = 'mempool')
+                              THEN 2 ELSE 0 END)
                        WHERE (%s.txid, %s.n) IN (SELECT txid, n FROM p)"""
-                    % (",".join(["(?,?)"] * len(chunk)), table,
+                    % (",".join(["(?,?::bigint)"] * len(chunk)), table,
                        table, table, table, table, table, table),
                     binds)
 
@@ -703,10 +817,20 @@ class DB:
         own, which is why it does not repair anything.
         """
         for chunk in _chunks(txids):
-            marks = ",".join("?" * len(chunk))
-            for table in ("txs", "vin", "vout", "addr_out"):
-                self.conn.execute(
-                    "DELETE FROM %s WHERE txid IN (%s)" % (table, marks), chunk)
+            # One statement, not four, through data-modifying CTEs. Every one of
+            # them deletes the same txid set from a different table, none of them
+            # reads what another wrote, and an unreferenced data-modifying CTE is
+            # still executed -- so this is four deletes for the price of one round
+            # trip, which is the whole cost at a fresh height where all four
+            # match nothing. Kept as DELETEs rather than skipped when the txid is
+            # new: "no txs row" is not proof of "no child rows", and a re-index
+            # that left a stray vin/vout behind would double-count the balance.
+            self.conn.execute(
+                "WITH d1 AS (DELETE FROM txs      WHERE txid = ANY(?::text[])), "
+                "     d2 AS (DELETE FROM vin      WHERE txid = ANY(?::text[])), "
+                "     d3 AS (DELETE FROM vout     WHERE txid = ANY(?::text[])), "
+                "     d4 AS (DELETE FROM addr_out WHERE txid = ANY(?::text[])) "
+                "SELECT 1", (chunk, chunk, chunk, chunk))
 
     def _clear_from(self, height):
         # What this truncation retracts, read while the rows still hold their
@@ -718,7 +842,7 @@ class DB:
         # point, so it costs the depth of the reorg, not the length of the
         # chain.
         orphaned_minted, orphaned_txs = self.conn.execute(
-            "SELECT COALESCE(SUM(v.value),0), COUNT(*) FROM txs t "
+            "SELECT COALESCE(SUM(v.value)::bigint, 0), COUNT(*) FROM txs t "
             "JOIN vout v ON v.txid = t.txid "
             "WHERE t.status='confirmed' AND t.is_coinbase=1 AND t.height >= ?",
             (height,)).fetchone()
@@ -787,18 +911,120 @@ class DB:
                 "UPDATE blocks SET next_hash=? WHERE hash=?",
                 (b.hash, b.prev_hash))
         # One primary-key seek to tell a new height from a re-index of one we
-        # already hold: INSERT OR REPLACE below cannot report which it did,
-        # and the block count is the number of heights, not of writes.
+        # already hold: the upsert below cannot report which it did, and the
+        # block count is the number of heights, not of writes.
         new_height = self.conn.execute(
             "SELECT 1 FROM blocks WHERE height=?", (b.height,)).fetchone() is None
+        # ON CONFLICT (height) rather than the INSERT OR REPLACE this replaces:
+        # REPLACE would also swallow a violation of blocks.hash's unique
+        # index, deleting whichever row held the hash. That can only happen if
+        # a hash is indexed at two heights, and a reorg reaches that through
+        # _clear_from, which deletes the tail before anything is re-added --
+        # so a height conflict is the only one left to handle, and letting the
+        # other one raise is better than silently dropping a block row.
         self.conn.execute(
-            """INSERT OR REPLACE INTO blocks
+            """INSERT INTO blocks
                (height, hash, version, merkleroot, time, nonce, bits,
                 difficulty, size, prev_hash, next_hash)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
+               VALUES (?,?,?,?,?,?,?,?,?,?,?)
+               ON CONFLICT (height) DO UPDATE SET
+                 hash=EXCLUDED.hash, version=EXCLUDED.version,
+                 merkleroot=EXCLUDED.merkleroot, time=EXCLUDED.time,
+                 nonce=EXCLUDED.nonce, bits=EXCLUDED.bits,
+                 difficulty=EXCLUDED.difficulty, size=EXCLUDED.size,
+                 prev_hash=EXCLUDED.prev_hash, next_hash=EXCLUDED.next_hash""",
             (b.height, b.hash, b.version, b.merkleroot, b.time, b.nonce,
              b.bits, b.difficulty, b.size, b.prev_hash, b.next_hash))
         self._bump(N_BLOCKS_KEY, 1 if new_height else 0)
+
+    def _discard_writes(self):
+        """Drop everything buffered, for a bulk window that failed."""
+        self._buf = None
+        self._buf_del = None
+        self._buf_flags = None
+        self._buf_bumps = None
+
+    def _flush_writes(self):
+        """Write out a bulk window: deletes, rows, flags, counters, in order.
+
+        The order is the dependency order and must not be rearranged. Deletes
+        before the inserts, or a window that re-indexes a txid would collide
+        with its own buffered rows on the primary key. The rows before the
+        flags, because the flags are derived from the vin rows by EXISTS and
+        would read an empty table if they went first. The flags before the
+        counters, because nothing in a counter depends on them but a caller
+        that reads a balance inside the same transaction would see rows with
+        stale masks if the flags were still pending.
+
+        Safe to call when nothing is buffered, and safe to call repeatedly: both
+        are how the paths that must not see buffered rows (a read, an eviction, a
+        re-index of a txid already held) force the window down early. Note that
+        flushing EMPTIES the buffers rather than dismantling them -- a window
+        can be flushed several times and must keep buffering after each one, or
+        the rest of the window would silently drop back to writing per tx.
+        """
+        if self._buf is None:
+            return
+        if self._buf_del:
+            self._delete_tx_rows(sorted(self._buf_del))
+        rows_by_table = {}
+        for table_rows in self._buf.values():
+            for table, sql, rows in table_rows:
+                rows_by_table.setdefault(table, (sql, []))[1].extend(rows)
+        for sql, rows in rows_by_table.values():
+            for chunk in _chunks(rows):
+                self.conn.executemany(sql, chunk)
+        flags = sorted(self._buf_flags)
+        bumps = dict(self._buf_bumps)
+        self._buf.clear()
+        self._buf_del.clear()
+        self._buf_flags.clear()
+        self._buf_bumps.clear()
+        # Take the window down before applying what it held, and put it back
+        # after. This is not tidiness: the buffers are now empty but not None,
+        # and _bump treats a non-None buffer as "a window is open", so writing
+        # the counters while the window was still standing would re-buffer every
+        # delta and the flush would finish having written nothing to meta. Same
+        # for the flag refresh if it ever bumps anything.
+        standing = (self._buf, self._buf_del, self._buf_flags, self._buf_bumps)
+        self._buf = self._buf_del = self._buf_flags = self._buf_bumps = None
+        try:
+            if flags:
+                self._refresh_spent_flags(flags)
+            for key, delta in bumps.items():
+                self._bump(key, delta)
+        finally:
+            # The window is still open, so buffering has to resume for whatever
+            # comes next -- even if applying what it held just failed.
+            (self._buf, self._buf_del,
+             self._buf_flags, self._buf_bumps) = standing
+
+    def _write_rows(self, txid, table_rows):
+        """Replace `txid`'s rows with `table_rows`, now or at the flush.
+
+        Owns the delete for both paths, because the two have to agree on when
+        it happens: outside a window the old rows go now, before the new ones;
+        inside one, the txid joins `_buf_del` and the flush does both in that
+        order. Splitting the delete out to the caller is what let the sets drift
+        apart -- a flush triggered from here empties `_buf_del`, so a txid
+        re-buffered immediately afterwards has to put itself back in.
+        """
+        if self._buf is None:
+            self._delete_tx_rows([txid])
+            for _, sql, rows in table_rows:
+                if rows:
+                    self.conn.executemany(sql, rows)
+            return
+        # A txid already buffered in this window: its rows are not in the table
+        # yet, so the SELECTs _add_tx is about to make -- what this txid used to
+        # hold, and whether it is a re-index -- would miss them. Put the window
+        # down first rather than reason about which of the two answers is right.
+        # That flush also writes the version now being replaced, so re-adding
+        # the txid below is what gives the replacement a delete of its own.
+        if txid in self._buf:
+            self._flush_writes()
+        self._buf_del.add(txid)
+        self._buf[txid] = table_rows
 
     def add_tx(self, t):
         if not self._in_bulk:
@@ -830,9 +1056,8 @@ class DB:
         prev_minted = 0
         if prev is not None and prev[1] and prev[0] == "confirmed":
             prev_minted = self.conn.execute(
-                "SELECT COALESCE(SUM(value),0) FROM vout WHERE txid=?",
+                "SELECT COALESCE(SUM(value)::bigint, 0) FROM vout WHERE txid=?",
                 (t.txid,)).fetchone()[0]
-        self._delete_tx_rows([t.txid])
         # The one place a row's confirmed-vs-mempool bit is decided. Set from
         # the incoming tx's height and never revisited afterwards, because
         # orphaned rows are deleted rather than flagged, so an output's owner
@@ -841,41 +1066,28 @@ class DB:
         # which on the 510k-output address was 510k random seeks to learn
         # something every row already knew.
         mempool = 0 if t.height is not None else 1
-        self.conn.execute(
-            """INSERT INTO txs
-               (txid, height, tx_index, version, locktime, size,
-                is_coinbase, status)
-               VALUES (?,?,?,?,?,?,?,?)""",
-            (t.txid, t.height, t.tx_index, t.version, t.locktime, t.size,
-             1 if t.is_coinbase else 0,
-             'confirmed' if t.height is not None else 'mempool'))
+        tx_rows = [(t.txid, t.height, t.tx_index, t.version, t.locktime,
+                    t.size, 1 if t.is_coinbase else 0,
+                    'confirmed' if t.height is not None else 'mempool')]
+        vin_rows = []
+        vout_rows = []
+        addr_rows = []
+        script_rows = []
         for i, ipt in enumerate(t.vin):
-            self.conn.execute(
-                """INSERT INTO vin
-                   (txid, n, prev_txid, prev_vout, coinbase,
-                    script_asm, script_hex, sequence)
-                   VALUES (?,?,?,?,?,?,?,?)""",
+            vin_rows.append(
                 (t.txid, i, ipt.prev_txid, ipt.prev_vout, ipt.coinbase,
                  ipt.script_asm, ipt.script_hex, ipt.sequence))
         for n, ot in enumerate(t.vout):
             sh = script_hash_of(ot.script_hex)
-            self.conn.execute(
-                """INSERT INTO vout
-                   (txid, n, value, type, addresses, req_sigs,
-                    script_asm, script_hex, script_hash, mempool)
-                   VALUES (?,?,?,?,?,?,?,?,?,?)""",
-                (t.txid, n, ot.value, ot.type,
-                 json.dumps(ot.addresses), ot.req_sigs,
-                 ot.script_asm, ot.script_hex, sh, mempool))
+            vout_rows.append(
+                (t.txid, n, ot.value, ot.type, json.dumps(ot.addresses),
+                 ot.req_sigs, ot.script_asm, ot.script_hex, sh, mempool))
             # Consensus accounting lives at SCRIPT level: the output belongs
             # to the whole script (all-of-N participants for multisig), not
             # to any single participant. So a multi-address vout credits no
-            # one fully -- attes the value into the scripts entity instead.
+            # one fully -- attests the value into the scripts entity instead.
             if len(ot.addresses) == 1:
-                self.conn.execute(
-                    """INSERT INTO addr_out
-                       (address, txid, n, value, type, mempool)
-                       VALUES (?,?,?,?,?,?)""",
+                addr_rows.append(
                     (ot.addresses[0], t.txid, n, ot.value, ot.type, mempool))
             if sh is not None:
                 # Metadata only. Balances are derived from vout/vin on read (see
@@ -884,27 +1096,24 @@ class DB:
                 #
                 # Heights are confirmed-only: a mempool tx arrives with a NULL
                 # height and must neither fabricate a height nor erase a real
-                # one. Scalar MIN()/MAX() over two arguments returns NULL if
-                # EITHER is NULL -- unlike the aggregate form -- so each side is
-                # coalesced into the other first: that yields the min/max when
-                # both are known, and passes the known one through otherwise.
-                self.conn.execute(
-                    """INSERT INTO scripts
-                       (script_hash, type, req_sigs, addresses,
-                        created_height, last_height)
-                       VALUES (?,?,?,?,?,?)
-                       ON CONFLICT(script_hash) DO UPDATE SET
-                         created_height = MIN(COALESCE(scripts.created_height,
-                                                      excluded.created_height),
-                                             COALESCE(excluded.created_height,
-                                                      scripts.created_height)),
-                         last_height = MAX(COALESCE(scripts.last_height,
-                                                    excluded.last_height),
-                                           COALESCE(excluded.last_height,
-                                                    scripts.last_height))
-                       """,
-                    (sh, ot.type, ot.req_sigs,
-                     json.dumps(ot.addresses), t.height, t.height))
+                # one. LEAST/GREATEST is what carries that, and the dialect
+                # difference matters if this is ever ported back: Postgres
+                # skips NULL arguments and returns NULL only when every
+                # argument is, whereas SQLite's two-argument min()/max()
+                # propagates NULL and so erases a known height whenever an
+                # unconfirmed one arrives. Under Postgres the bare form is the
+                # whole fix -- NULL loses to the real value either way -- and
+                # the COALESCE pairs SQLite needed are dropped with it.
+                script_rows.append(
+                    (sh, ot.type, ot.req_sigs, json.dumps(ot.addresses),
+                     t.height, t.height))
+        self._write_rows(t.txid, (
+            ("txs", SQL_INSERT_TXS, tx_rows),
+            ("vin", SQL_INSERT_VIN, vin_rows),
+            ("vout", SQL_INSERT_VOUT, vout_rows),
+            ("addr_out", SQL_INSERT_ADDR_OUT, addr_rows),
+            ("scripts", SQL_INSERT_SCRIPTS, script_rows),
+        ))
         # is_spent is a fact about vin, not something the INSERTs above get to
         # decide, and this is the only place that writes it. Deriving it in the
         # input loop instead would miss a child indexed before its parent, and
@@ -913,13 +1122,32 @@ class DB:
         # wrong -- this version's inputs (marked spent by the vin rows just
         # written), its own outputs, and the prevouts a previous version held
         # that this one does not -- in one batched pass at the end.
-        self._refresh_spent_flags(
-            sorted(held) + [(t.txid, n) for n, _ in enumerate(t.vout)] + released)
+        if self._buf_flags is not None:
+            # Deferred to the flush: the flags are an EXISTS over the vin table,
+            # so they cannot be computed until this tx's vin rows are actually
+            # in it -- and recomputing them once for the whole window is both
+            # correct (they are derived, and idempotent) and far cheaper than
+            # once per tx.
+            self._buf_flags.extend(sorted(held))
+            self._buf_flags.extend((t.txid, n) for n, _ in enumerate(t.vout))
+            self._buf_flags.extend(released)
+        else:
+            self._refresh_spent_flags(
+                sorted(held) + [(t.txid, n) for n, _ in enumerate(t.vout)]
+                + released)
         # Minted supply moves by exactly what this version added over what the
         # previous one had counted. height IS NULL while unconfirmed, so a
         # mempool coinbase adds nothing until it is indexed into a block.
+        #
+        # The is_coinbase test is load-bearing and must match the prev_minted test
+        # above: a normal tx redistributes value already in circulation, so it mints
+        # nothing, and only prev_minted was gated on it. Counting every confirmed
+        # tx's outputs here while only subtracting coinbases left the counter
+        # tracking total confirmed throughput instead of supply -- on this rig, 4.46x
+        # too high, growing with every transaction.
         self._bump(COINBASE_TOTAL_KEY,
-                   (sum(ot.value for ot in t.vout) if t.height is not None else 0)
+                   (sum(ot.value for ot in t.vout)
+                    if t.is_coinbase and t.height is not None else 0)
                    - prev_minted)
         # n_txs counts non-orphaned rows: a re-index of a live tx replaces it
         # and nets to zero, while an orphan returning to the chain or the
@@ -944,12 +1172,16 @@ class DB:
 
         Removing a whole mempool eviction in one call is the normal case, and
         the spent flags are recomputed in a single pass AFTER every delete.
+        Flushed first, for the same reason as clear_from: an eviction must see
+        the rows an open window is holding, or it deletes nothing and the flush
+        then re-inserts what was just evicted.
         That makes the result independent of the order the txs are removed in:
         an output spent by two of them, or by one whose own output is also
         being removed, is re-evaluated against the final set of spending
         inputs instead of a half-emptied table. The scripts metadata is
         rebuilt from what survives, for the same order-independence.
         """
+        self._flush_writes()
         txids = list(txids)
         if not txids:
             return
@@ -960,10 +1192,10 @@ class DB:
             self._remove_txs(txids)
 
     def _remove_txs(self, txids):
-        # Chunked because a mempool eviction can be longer than SQLite's bind
-        # cap, and one statement cannot hold every stale id. The chunks share
-        # the single transaction remove_txs() opened, so the eviction is still
-        # all-or-nothing: either every stale tx goes or none of it does.
+        # Chunked because a mempool eviction can be long, and one statement
+        # cannot hold every stale id. The chunks share the single transaction
+        # remove_txs() opened, so the eviction is still all-or-nothing: either
+        # every stale tx goes or none of it does.
         spent_prev = []
         touched = []
         dropped_txs = 0
@@ -980,8 +1212,9 @@ class DB:
             # deleting one must not retract again.
             live, minted = self.conn.execute(
                 "SELECT COUNT(*), COALESCE(SUM(CASE WHEN t.is_coinbase=1 "
-                "AND t.status='confirmed' THEN (SELECT COALESCE(SUM(v.value),0) "
-                "FROM vout v WHERE v.txid = t.txid) ELSE 0 END), 0) "
+                "AND t.status='confirmed' THEN (SELECT COALESCE(SUM(v.value)"
+                "::bigint, 0) "
+                "FROM vout v WHERE v.txid = t.txid) ELSE 0 END)::bigint, 0) "
                 "FROM txs t WHERE t.status != 'orphaned' AND t.txid IN (%s)"
                 % marks, chunk).fetchone()
             dropped_txs += live
@@ -1021,6 +1254,10 @@ class DB:
         self._bump(N_TXS_KEY, -dropped_txs)
 
     def query(self, sql, params=()):
+        # A read inside an open window would otherwise see the table without the
+        # rows still sitting in the buffer, which is the one thing a reader
+        # cannot be allowed to do. Cheap when nothing is buffered.
+        self._flush_writes()
         return self.conn.execute(sql, params).fetchall()
 
     # --- maintained counters ---------------------------------------------
@@ -1036,6 +1273,10 @@ class DB:
     # nothing, and retracting again would drive a count negative.
 
     def _stat(self, key, default=0):
+        # Same reasoning as query(): a counter read inside an open window would
+        # miss the deltas still buffered for it. _bump only reaches this when
+        # nothing is buffered, so the flush here cannot re-enter.
+        self._flush_writes()
         row = self.conn.execute(
             "SELECT value FROM meta WHERE key=?", (key,)).fetchone()
         return int(row[0]) if row and row[0] is not None else default
@@ -1045,15 +1286,21 @@ class DB:
 
         A bare execute(), never set_meta(): set_meta opens `with self.conn`,
         which COMMITs, and that would end the surrounding bulk transaction
-        mid-block -- committing a half-indexed block and dropping the
-        EXCLUSIVE lock a migration is holding. Same reason
-        _migrate_scripts_columns avoids executescript().
+        mid-block -- committing a half-indexed block. Same reason
+        rebuild_scripts avoids set_meta.
 
         Read-modify-write in Python rather than SQL arithmetic, so the value
         is an int the whole way rather than a string that meta.value's TEXT
-        affinity has to round-trip on every block.
+        column has to round-trip on every block.
         """
         if not delta:
+            return
+        if self._buf_bumps is not None:
+            # Accumulated rather than read-and-written per tx: a window of 500
+            # txs would otherwise do 500 read-modify-writes of the same three
+            # meta rows, which is two round trips each to move a number that
+            # only has to be right at the end. The flush writes the sum once.
+            self._buf_bumps[key] = self._buf_bumps.get(key, 0) + delta
             return
         self.conn.execute(
             "INSERT INTO meta(key, value) VALUES(?,?) "
@@ -1073,6 +1320,7 @@ class DB:
         return self._seeded_stat(N_TXS_KEY)
 
     def _seeded_stat(self, key):
+        self._flush_writes()
         row = self.conn.execute(
             "SELECT value FROM meta WHERE key=?", (key,)).fetchone()
         if row is not None and row[0] is not None:
@@ -1096,6 +1344,14 @@ class DB:
         as the rows -- but this is how you find out whether one drifted, and
         how a database backfilled by an older build gets fresh values without
         a scan running on a request.
+
+        Deliberately does NOT commit: the caller owns the transaction, and
+        Nothing inside the explorer calls it: every write path maintains the
+        counters in the same transaction as the rows, and a database built from
+        scratch has them from block 0. So a mismatch means something has
+        diverged, and rescanning is how you find out what. The cost is that a
+        caller which runs this and exits without committing silently discards
+        the repair. So commit after calling this.
         """
         out = {}
         for key, sql in STATS:
@@ -1107,34 +1363,6 @@ class DB:
             out[key] = value
         return out
 
-    def _backfill_stats(self):
-        """Seed the counters once per database, under the migration's lock.
-
-        Carries its own meta flag rather than riding SCHEMA_VERSION: a version
-        bump would re-run _migrate()'s full rebuild_scripts() on every existing
-        database -- a 7M-row re-aggregate -- to store three integers.
-
-        EXCLUSIVE, like _migrate, because the indexer and the web server both
-        open this file: first comer seeds, the rest block on busy_timeout and
-        then find the flag already set. Readers keep going throughout -- WAL
-        lets them read the pre-backfill snapshot -- so a page load during the
-        backfill waits on nothing and is served the old value rather than an
-        error. The minted-supply scan is the slow part (31s on a 4.6M-block
-        chain), which is why it happens once here and never on a request.
-        """
-        if self.get_meta(STATS_SEEDED_KEY) is not None:
-            return
-        self.conn.execute("BEGIN EXCLUSIVE")
-        try:
-            if self.get_meta(STATS_SEEDED_KEY) is not None:
-                self.conn.commit()
-                return
-            self.recompute_stats()
-            self.set_meta(STATS_SEEDED_KEY, "1")
-            self.conn.commit()
-        except BaseException:
-            self.conn.rollback()
-            raise
 
     # The two balance views, as one index-only scan each. Written once and
     # parameterised because addr_out and vout ask the identical question of an
@@ -1154,10 +1382,17 @@ class DB:
     # of keeping them flagged. That invariant is what lets the live view skip
     # the status test the confirmed view still needs, and it is why no
     # statement here mentions txs at all.
+    # `spent_by` is a bitmask, so the test has to be a comparison and not a bare
+    # mask: SQLite treats any nonzero integer as true, Postgres insists on a
+    # real boolean and would reject `CASE WHEN spent_by & 1 THEN` outright.
+    # `& 0 <> 0` is written longhand rather than `::bool` so the condition
+    # stays true/false on NULL the same way it did under SQLite -- a NULL
+    # mask is falsy there, and `<> 0` against NULL is NULL, so the row is
+    # skipped either way.
     _BALANCE_VIEWS = (
         # view        owner        spender
-        ("confirmed", "mempool=0", "spent_by & 1"),
-        ("live",      "1",         "spent_by & 3"),
+        ("confirmed", "mempool=0", "(spent_by & 1) <> 0"),
+        ("live",      "TRUE",      "(spent_by & 3) <> 0"),
     )
 
     def _balances(self, table, key_col, key, count_col):
@@ -1172,9 +1407,10 @@ class DB:
         out = {}
         for view, owner, spender in self._BALANCE_VIEWS:
             received, n_out, spent, n_spent = self.conn.execute(
-                "SELECT COALESCE(SUM(CASE WHEN %s THEN value END),0), "
+                "SELECT COALESCE(SUM(CASE WHEN %s THEN value END)::bigint, 0), "
                 "       COUNT(CASE WHEN %s THEN 1 END), "
-                "       COALESCE(SUM(CASE WHEN %s AND (%s) THEN value END),0), "
+                "       COALESCE(SUM(CASE WHEN %s AND (%s) "
+                "                    THEN value END)::bigint, 0), "
                 "       COUNT(CASE WHEN %s AND (%s) THEN 1 END) "
                 "FROM %s WHERE %s=?" % (owner, owner, owner, spender,
                                         owner, spender, table, key_col),
@@ -1222,7 +1458,7 @@ class DB:
     def rebuild_scripts(self, script_hashes=None):
         """Recompute the scripts table's metadata.
 
-        With no argument, rebuild the whole table: on migration (backfill) that
+        With no argument, rebuild the whole table: on a reorg that
         is the only option, since nothing is known about what is already there.
 
         With script_hashes, recompute only those scripts -- what a reorg needs.
@@ -1237,6 +1473,7 @@ class DB:
         NULLs, so a script that has only ever been seen unconfirmed gets NULL
         for both rather than a sentinel height.
         """
+        self._flush_writes()
         if script_hashes is None:
             self.conn.execute("DELETE FROM scripts")
             scopes = [("WHERE v.script_hash IS NOT NULL", ())]
@@ -1268,11 +1505,19 @@ class DB:
                    GROUP BY v.script_hash""" % where, params).fetchall()
             if need_seen:
                 seen.update(r[0] for r in rows)
+            # ON CONFLICT rather than INSERT OR REPLACE: the columns are all
+            # overwritten wholesale either way, and upsert leaves the existing
+            # row's identity alone, where REPLACE would delete and reinsert it.
             self.conn.executemany(
-                """INSERT OR REPLACE INTO scripts
+                """INSERT INTO scripts
                    (script_hash, type, req_sigs, addresses,
                     created_height, last_height)
-                   VALUES (?,?,?,?,?,?)""", rows)
+                   VALUES (?,?,?,?,?,?)
+                   ON CONFLICT (script_hash) DO UPDATE SET
+                     type=EXCLUDED.type, req_sigs=EXCLUDED.req_sigs,
+                     addresses=EXCLUDED.addresses,
+                     created_height=EXCLUDED.created_height,
+                     last_height=EXCLUDED.last_height""", rows)
         if script_hashes is not None:
             # A script whose every output was severed has nothing left to
             # describe, so it leaves the table -- the same thing the full
@@ -1293,5 +1538,6 @@ class DB:
     def set_meta(self, key, value):
         with self.conn:
             self.conn.execute(
-                "INSERT OR REPLACE INTO meta(key, value) VALUES (?,?)",
+                "INSERT INTO meta(key, value) VALUES (?,?) "
+                "ON CONFLICT (key) DO UPDATE SET value=EXCLUDED.value",
                 (key, value))

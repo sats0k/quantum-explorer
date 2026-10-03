@@ -1,5 +1,10 @@
 """Regression tests. Run: python3 -m unittest test_db -v
 
+Needs a PostgreSQL server; point $EXPLORER_TEST_DSN at it (default
+"dbname=explorer_test"). Each test gets its own schema inside that
+database, so the suite runs against one server and a test's leftovers
+cannot collide with the next one's.
+
 The mempool-eviction cases matter because removing a chain of txs (A -> B -> C)
 leaves addr_out.spent_by describing whichever mempool the index happened to be
 holding when each delete ran. The property under test is that the final state is
@@ -10,15 +15,17 @@ every permutation rather than one hand-picked sequence.
 import contextlib
 import itertools
 import json
-import queue
-import random
 import os
+import queue
+import re
+import random
 import shutil
-import sqlite3
 import tempfile
 import threading
 import unittest
 from unittest import mock
+
+import psycopg
 
 import db as db_module
 import indexer as indexer_module
@@ -31,6 +38,99 @@ from rpc import CallError, RPCError
 from server import DBPool, Explorer, poke
 
 POKE = 100_000_000
+
+# The server the suite runs against. One database, one schema per test.
+TEST_DSN = os.environ.get("EXPLORER_TEST_DSN", "dbname=explorer_test")
+
+# Schema names have to be unique across the whole run, including tests that
+# create their own schema by hand, so the counter is module-level.
+_schema_seq = itertools.count()
+
+
+def _with_search_path(dsn, schema):
+    """Return `dsn` pinned to `schema`.
+
+    Passed as a libpq `options` parameter rather than a SET the connection has
+    to remember to run, so every connection built from the same string -- the
+    pool's four, a test's second DB -- lands in the same schema without any of
+    them having to do anything.
+    """
+    if "://" in dsn:                       # a URI DSN
+        sep = "&" if "?" in dsn else "?"
+        return "%s%soptions=-c%%20search_path%%3D%s" % (dsn, sep, schema)
+    return "%s options='-c search_path=%s'" % (dsn, schema)
+
+
+def _create_schema(name):
+    with contextlib.closing(psycopg.connect(TEST_DSN, autocommit=True)) as c:
+        c.execute("CREATE SCHEMA " + name)
+
+
+def _drop_schema(name):
+    with contextlib.closing(psycopg.connect(TEST_DSN, autocommit=True)) as c:
+        c.execute("DROP SCHEMA IF EXISTS %s CASCADE" % name)
+
+
+@contextlib.contextmanager
+def force_index_use(db):
+    """EXPLAIN with sequential scans switched off, for plan assertions.
+
+    The plan tests below ask which index serves a lookup, but their fixtures are
+    a row or two, and on a table that small a sequential scan really is cheaper
+    than any index -- the planner is right, and asserting an index node would be
+    asserting something the server was never asked to choose. Turning seqscan
+    off for the duration makes the plan the index-only one the test is about,
+    which is what is being checked: that the covering index CAN answer the
+    lookup without touching the table, not that it beats a scan on one row.
+    """
+    db.conn.execute("SET enable_seqscan = off")
+    try:
+        yield
+    finally:
+        db.conn.execute("SET enable_seqscan = on")
+
+
+def indexes_on(db, table):
+    """Index names on `table`, sorted. pg_indexes is the catalog listing."""
+    return sorted(r[0] for r in db.query(
+        "SELECT indexname FROM pg_indexes "
+        "WHERE schemaname = current_schema() AND tablename = ?", (table,)))
+
+
+def tables_in(db):
+    """Table names in the connection's current schema."""
+    return {r[0] for r in db.query(
+        "SELECT table_name FROM information_schema.tables "
+        "WHERE table_schema = current_schema()")}
+
+
+def columns_of(db, table):
+    return [r[0] for r in db.query(
+        "SELECT column_name FROM information_schema.columns "
+        "WHERE table_schema = current_schema() AND table_name = ?", (table,))]
+
+
+def _schema_dsn(name=None):
+    """A fresh schema, dropped when the test ends, and a DSN pointing at it."""
+    name = name or "t%d_%d" % (os.getpid(), next(_schema_seq))
+    _create_schema(name)
+    return name, _with_search_path(TEST_DSN, name)
+
+
+class _PGTestCase(unittest.TestCase):
+    """Base for tests that need a database but not the DB fixture."""
+
+    def add_schema_dsn(self):
+        """A DSN for a schema of its own, dropped when the test ends."""
+        name, dsn = _schema_dsn()
+        self.addCleanup(_drop_schema, name)
+        return dsn
+
+    def fresh_schema(self):
+        """(name, dsn) for a second schema, for tests needing two."""
+        name, dsn = _schema_dsn()
+        self.addCleanup(_drop_schema, name)
+        return name, dsn
 
 
 class FakeDaemon:
@@ -160,26 +260,43 @@ def full_spent_recompute(db):
             % (table, table, table, table, table))
 
 
-class DBTestCase(unittest.TestCase):
+class DBTestCase(_PGTestCase):
     def setUp(self):
-        self.dir = self._new_dir()
-        self.db_path = os.path.join(self.dir, "test.db")
+        self.schema, self.db_path = self.fresh_schema()
         self.db = self.fresh_db(self.db_path)
         self.indexer = Indexer(self.db, rpc=None)
         self.explorer = Explorer(self.db)
 
-    def _new_dir(self):
-        path = tempfile.mkdtemp()
-        self.addCleanup(shutil.rmtree, path, ignore_errors=True)
-        return path
-
-    def fresh_db(self, path=None):
+    def fresh_db(self, dsn=None):
         """A DB of its own, for tests that need more than one."""
-        if path is None:
-            path = os.path.join(self._new_dir(), "test.db")
-        db = DB(path)
+        if dsn is None:
+            dsn = self.add_schema_dsn()
+        db = DB(dsn)
         self.addCleanup(db.conn.close)
         return db
+
+    def reopened(self, rebuild):
+        """A second connection to this test's schema, as a cold start opens it.
+
+        `rebuild` is passed straight through, because whether a reopen may
+        discard the chain is the thing the rebuild tests vary.
+        """
+        db = DB.initialize(self.db_path, rebuild=rebuild)
+        self.addCleanup(db.conn.close)
+        return db
+
+    def derived(self):
+        """The total as the defining query computes it, ignoring the counter."""
+        return self.db.conn.execute(
+            db_module.TOTAL_COINBASE_SQL).fetchone()[0]
+
+    def assertMatchesDerived(self, msg=""):
+        """Every maintained counter must equal the query that defines it."""
+        for key, sql in db_module.STATS:
+            self.assertEqual(self.db._stat(key),
+                             self.db.conn.execute(sql).fetchone()[0],
+                             "%s: %s" % (key, msg))
+
 
     def spent_by(self, txid, n=0):
         """The spent_by mask of an output, or None when the output is gone.
@@ -310,30 +427,25 @@ class MempoolEvictionTest(DBTestCase):
 
 
 class VariableLimitTest(DBTestCase):
-    """Id lists longer than SQLite's bind cap must not fail.
+    """Id lists longer than one statement's bind cap must not fail.
 
-    SQLITE_LIMIT_VARIABLE_NUMBER is compiled in -- 999 on older builds, 32766
-    since 3.32 -- and a statement over it raises "too many SQL variables" rather
-    than degrading. The caller's transaction rolls that back whole, so the
-    effect is a permanently stuck indexer: a mempool too big to evict, or a
-    reorg too deep to apply, retried forever. The limit is lowered here instead
-    of indexing a 32k-tx mempool, so the test bites on every host.
+    Postgres allows 65535 parameters per statement and a statement over it
+    raises rather than degrading, which would roll back the caller's whole
+    transaction: a permanently stuck indexer, a mempool too big to evict or a
+    reorg too deep to apply, retried forever. Reaching 65535 to test that
+    would take minutes, so the cap is simulated the way it bites -- by making
+    the chunk size small, which is the same code path a real overrun takes.
     """
 
-    LIMIT = getattr(sqlite3, "SQLITE_LIMIT_VARIABLE_NUMBER", None)
-    NEEDS_SETLIMIT = not hasattr(sqlite3.Connection, "setlimit")
-
-    def setUp(self):
-        super().setUp()
-        if self.NEEDS_SETLIMIT:
-            self.skipTest("needs Connection.setlimit (Python 3.11+)")
-        self.capped = self.db.conn.getlimit(self.LIMIT)
-
     def cap_variables(self, n):
-        self.db.conn.setlimit(self.LIMIT, n)
-
-    def uncapped(self):
-        self.db.conn.setlimit(self.LIMIT, self.capped)
+        # addCleanup takes stop, not the patcher. Handing it the patcher calls
+        # __enter__ again, which re-patches rather than undoing, and the cap
+        # would outlive the test and shrink the chunk for every test after it.
+        # SQLite's setlimit was per-connection so it could not leak like this;
+        # the chunk size is module-level here, so it has to be undone.
+        patcher = mock.patch.object(db_module, "SQL_VAR_CHUNK", n)
+        patcher.start()
+        self.addCleanup(patcher.stop)
 
     def fill_mempool(self, n):
         """n mempool txs, all one address, none spending anything."""
@@ -344,8 +456,9 @@ class VariableLimitTest(DBTestCase):
                                   coinbase=True))
         return ["M%05d" % i for i in range(n)]
 
-    def counts(self):
-        return [self.db.query("SELECT COUNT(*) FROM " + t)[0][0]
+    def counts(self, db=None):
+        db = db or self.db
+        return [db.query("SELECT COUNT(*) FROM " + t)[0][0]
                 for t in ("txs", "vin", "vout", "addr_out", "scripts")]
 
     def test_an_eviction_past_the_bind_cap_works(self):
@@ -372,9 +485,7 @@ class VariableLimitTest(DBTestCase):
                 db.add_tx(tx(stale[i], None,
                              [("addr%d" % (i % 97), POKE, i + 1)], coinbase=True))
         db.remove_txs(stale)                      # host cap: one statement
-        self.assertEqual([db.query("SELECT COUNT(*) FROM " + t)[0][0]
-                          for t in ("txs", "vin", "vout", "addr_out", "scripts")],
-                         chunked)
+        self.assertEqual(self.counts(db), chunked)
 
     def test_a_chunked_eviction_is_still_one_transaction(self):
         # Chunking inside the transaction must not make a failure partial: the
@@ -383,8 +494,8 @@ class VariableLimitTest(DBTestCase):
         names = self.build_chain(3)
         self.cap_variables(2)                     # far below one chunk
         with mock.patch.object(DB, "_refresh_spent_flags",
-                               side_effect=sqlite3.OperationalError("boom")):
-            with self.assertRaises(sqlite3.OperationalError):
+                               side_effect=psycopg.OperationalError("boom")):
+            with self.assertRaises(psycopg.OperationalError):
                 self.db.remove_txs(list(names))
         self.assertEqual(self.counts(), [3, 3, 3, 3, 3], "half-evicted")
         # Bit 2, not bit 1: the chain is all mempool, so A and B are spent by an
@@ -399,7 +510,9 @@ class VariableLimitTest(DBTestCase):
         # txs do spend pays one UPDATE per output spent, which is inherent.)
         stale = self.fill_mempool(1000)
         seen = []
-        self.db.conn.set_trace_callback(seen.append)
+        real = self.db.conn.execute
+        self.db.conn.execute = lambda sql, params=(): (
+            seen.append(sql), real(sql, params))[1]
         self.db.remove_txs(stale)
         dml = [s for s in seen if s.lstrip().upper().startswith(
             ("SELECT", "DELETE", "INSERT", "UPDATE"))]
@@ -797,249 +910,47 @@ class BalanceParityTest(DBTestCase):
             self.legacy_balances("addr_out", "address", "a", "n_outputs"))
 
 
-class SpentMaskMigrationTest(DBTestCase):
-    """The spent_by backfill, on a database that predates the columns.
 
-    The migration is the one place this feature can be wrong in a way no later
-    write will fix: the columns are added defaulted to 0, and 0 means "unspent".
-    A partial backfill would therefore read as every output being unspent and
-    report a balance of the entire supply -- a wrong number rather than an
-    error. So it is exercised here from a genuinely pre-mask schema, on both of
-    its backfill paths, and checked against the derivation it replaced.
+class SchemaShapeTest(DBTestCase):
+    """What a fresh database looks like, as a property of SCHEMA alone.
+
+    There is no migration path to reconcile a fresh database against, so this
+    is the only definition of the shape there is -- and the two properties
+    below are what makes that safe to lean on: the bulk loader's index list is
+    derived from the same DDL that created the tables, and the tables are
+    named in exactly one place.
     """
 
-    def _demote_to_pre_mask(self, with_mempool=False):
-        """Rebuild addr_out and vout as they were before the columns existed.
+    def test_the_tables_are_exactly_those_the_schema_declares(self):
+        present = sorted(r[0] for r in self.db.conn.execute(
+            "SELECT tablename FROM pg_tables WHERE schemaname=current_schema()"))
+        self.assertEqual(present, ["addr_out", "blocks", "meta", "scripts",
+                                   "txs", "vin", "vout"])
 
-        The old shape is recreated by hand rather than by downgrading the
-        schema, because SQLite cannot remove a column that a covering index
-        depends on -- so the indexes go first, and the is_spent column is
-        restored with the value the fast backfill path reads.
-        """
-        with_mempool = with_mempool
-        for tag, height, spends in (("C1", 100, []), ("C2", 100, [])):
-            self.db.add_tx(tx(tag, height, [("a", POKE, 1)], coinbase=True))
-        self.db.add_tx(tx("S1", 101, [("z", POKE, 9)], spends=[("C1", 0)]))
-        if with_mempool:
-            self.db.add_tx(tx("M1", None, [("a", POKE, 1)], coinbase=True))
-            self.db.add_tx(tx("S2", None, [("z", POKE, 9)], spends=[("C2", 0)]))
-            self.db.add_tx(tx("S3", None, [("z", POKE, 9)], spends=[("C1", 0)]))
-        self.db.conn.execute("DROP INDEX IF EXISTS idx_addr_out_addr")
-        self.db.conn.execute("DROP INDEX IF EXISTS idx_vout_script")
-        for table in ("addr_out", "vout"):
-            self.conn_alter(table, "DROP COLUMN mempool")
-            self.conn_alter(table, "DROP COLUMN spent_by")
-        self.conn_alter("addr_out", "ADD COLUMN is_spent INTEGER DEFAULT 0")
-        # is_spent is the live reading, which is all the no-mempool fast path
-        # needs; a database that also has mempool spenders takes the other path.
-        self.db.conn.execute(
-            "UPDATE addr_out SET is_spent = EXISTS ("
-            "  SELECT 1 FROM vin WHERE vin.prev_txid = addr_out.txid"
-            "    AND vin.prev_vout = addr_out.n)")
-        self.db.conn.execute("DELETE FROM meta WHERE key = 'spent_mask'")
-        self.db.conn.commit()
-        self.db.conn.close()
-        # Deliberately does NOT reopen: the caller decides when to migrate, so
-        # a test can watch the migration fail rather than finding it already
-        # applied.
-
-    def conn_alter(self, table, clause):
-        self.db.conn.execute("ALTER TABLE %s %s" % (table, clause))
-
-    def masks(self, db):
-        return dict(db.query("SELECT txid, spent_by FROM addr_out"))
-
-    def vout_masks(self, db):
-        return dict(db.query("SELECT txid, spent_by FROM vout"))
-
-    def legacy(self, db, key="a"):
-        """The pre-mask balances, as the oracle for the migrated database."""
-        out = {}
-        for name, status in (("confirmed", "('confirmed')"),
-                             ("live", "('confirmed','mempool')")):
-            received, n = db.conn.execute(
-                "SELECT COALESCE(SUM(a.value),0), COUNT(*) FROM addr_out a "
-                "JOIN txs t ON t.txid = a.txid "
-                "WHERE a.address=? AND t.status IN %s" % status, (key,)).fetchone()
-            spent, n_spent = db.conn.execute(
-                "SELECT COALESCE(SUM(a.value),0), COUNT(*) FROM addr_out a "
-                "JOIN txs t ON t.txid = a.txid "
-                "WHERE a.address=? AND t.status IN %s AND EXISTS ("
-                "  SELECT 1 FROM vin i JOIN txs ti ON ti.txid=i.txid"
-                "  WHERE i.prev_txid=a.txid AND i.prev_vout=a.n"
-                "    AND ti.status IN %s)" % (status, status), (key,)).fetchone()
-            out[name] = {"value_received": received, "n_outputs": n,
-                         "value_spent": spent, "n_spent": n_spent,
-                         "balance": received - spent}
-        return out
-
-    def test_the_backfill_sets_the_masks_with_no_mempool(self):
-        self._demote_to_pre_mask(with_mempool=False)
-        db = self.fresh_db(self.db_path)
-        # C1 is spent by a confirmed tx, C2 by nothing. S1 pays to "z" and has
-        # rows of its own, unspent. vout is checked too, since it is the table
-        # the old is_spent shortcut did not cover.
-        self.assertEqual(self.masks(db), {"C1": 1, "C2": 0, "S1": 0})
-        self.assertEqual(self.vout_masks(db), {"C1": 1, "C2": 0, "S1": 0})
-        self.assertEqual(db.address_balances("a"), self.legacy(db))
-
-    def test_the_backfill_separates_the_spender_statuses(self):
-        # C1 has a confirmed AND a mempool spenter, C2 only a mempool one, M1 is
-        # a mempool output. Confirmed and live now genuinely differ, so a
-        # backfill that collapsed them into the old single boolean would be
-        # caught here and nowhere else.
-        self._demote_to_pre_mask(with_mempool=True)
-        db = self.fresh_db(self.db_path)
-        self.assertEqual(self.masks(db),
-                         {"C1": 3, "C2": 2, "M1": 0, "S1": 0, "S2": 0, "S3": 0})
-        self.assertEqual(self.vout_masks(db),
-                         {"C1": 3, "C2": 2, "M1": 0, "S1": 0, "S2": 0, "S3": 0})
-        self.assertEqual(db.address_balances("a"), self.legacy(db))
-        self.assertNotEqual(db.address_balances("a")["confirmed"],
-                            db.address_balances("a")["live"])
-
-    def test_the_migration_is_idempotent_and_runs_once(self):
-        self._demote_to_pre_mask()
-        db = self.fresh_db(self.db_path)
-        before = self.masks(db)
-        db.conn.close()
-        again = self.fresh_db(self.db_path)
-        self.assertEqual(self.masks(again), before, "re-seeding changed nothing")
-        self.assertEqual(again.get_meta("spent_mask"), "1")
-
-    def test_a_failed_backfill_leaves_no_half_migrated_schema(self):
-        # The flag is set on the way out, so a failure partway leaves a database
-        # the next start retries from the top -- rather than one whose columns
-        # exist and are all zero, which would read as nothing spent anywhere and
-        # report every balance as the full supply. Failing at the flag write is
-        # the worst case for this: the columns, the backfill, the dropped
-        # is_spent and the new indexes are all done by then, so all of it has to
-        # come back out.
-        self._demote_to_pre_mask()
-        real = DB.set_meta
-
-        def boom(self, key, value):
-            if key == "spent_mask":
-                raise sqlite3.OperationalError("boom")
-            return real(self, key, value)
-
-        with mock.patch.object(DB, "set_meta", boom):
-            with self.assertRaises(sqlite3.OperationalError):
-                DB(self.db_path)
-        db = self.fresh_db(self.db_path)
-        self.assertEqual(self.masks(db), {"C1": 1, "C2": 0, "S1": 0})
-        self.assertIn("idx_addr_out_addr", [
-            r[0] for r in db.conn.execute(
-                "SELECT name FROM sqlite_master WHERE type='index'"
-                " AND tbl_name='addr_out'")])
-
-    def test_a_failed_open_closes_the_connection_it_cannot_return(self):
-        # A constructor that raises never hands back the object holding the
-        # connection, so nothing downstream can close it. Covered here because
-        # the failure is otherwise only visible as a ResourceWarning, which a
-        # normal run does not surface and so lets the gap sit unnoticed.
-        #
-        # The failure is injected at _migrate because that is the shape that
-        # matters and the one the constructor cannot recover from by itself: a
-        # path that cannot be opened fails inside sqlite3.connect, before there
-        # is a connection to leak.
-        opened = []
-        real_connect = sqlite3.connect
-
-        def spy(*a, **kw):
-            conn = real_connect(*a, **kw)
-            opened.append(conn)
-            return conn
-
-        path = os.path.join(self._new_dir(), "test.db")
-        with mock.patch.object(db_module.sqlite3, "connect", spy), \
-             mock.patch.object(DB, "_migrate",
-                               side_effect=sqlite3.OperationalError("boom")):
-            with self.assertRaises(sqlite3.OperationalError):
-                DB(path)
-        self.assertEqual(len(opened), 1)
-        # A closed connection refuses work, which is how this is asked without
-        # depending on the warning the fix exists to prevent.
-        with self.assertRaises(sqlite3.ProgrammingError):
-            opened[0].execute("SELECT 1")
-
-
-class MigrationTest(DBTestCase):
-    def _demote_to_v2(self, n_txs=3):
-        """Put the DB back before the vout.script_hash backfill: no such column,
-        every script_hex present and unhashed."""
-        for i in range(n_txs):
-            self.db.add_tx(tx(chr(ord("A") + i), 100 + i,
-                              [("addr%d" % i, POKE, i + 1)], coinbase=True))
-        self.db.conn.execute("DROP TABLE scripts")
-        self.db.conn.execute(
-            """CREATE TABLE scripts (
-                 script_hash TEXT PRIMARY KEY, type TEXT, req_sigs INTEGER,
-                 addresses TEXT, value_received INTEGER DEFAULT 0,
-                 value_spent INTEGER DEFAULT 0, n_vout INTEGER DEFAULT 0,
-                 n_spent INTEGER DEFAULT 0, created_height INTEGER,
-                 last_height INTEGER)""")
-        self.db.conn.execute("UPDATE meta SET value='scripts_v2' "
-                             "WHERE key='schema_version'")
-        # add_tx fills script_hash in; clear it so the backfill has work to do.
-        self.db.conn.execute("UPDATE vout SET script_hash=NULL")
-        self.db.conn.commit()
-        self.db.conn.close()
-
-    def test_the_backfill_hashes_each_script_once(self):
-        # The vout backfill runs SHA256+RIPEMD160 per row on a large existing
-        # database, so it must not hash twice per row.
-        self._demote_to_v2(3)
-        real = db_module.script_hash_of
-        calls = []
-
-        def counting(hx):
-            calls.append(hx)
-            return real(hx)
-
-        with mock.patch.object(db_module, "script_hash_of", counting):
-            db = self.fresh_db(self.db_path)
-        self.addCleanup(db.conn.close)
-        hashed = [r[0] for r in db.query(
-            "SELECT script_hex FROM vout WHERE script_hash IS NOT NULL")]
-        self.assertEqual(len(calls), len(hashed))
-        self.assertEqual(len(calls), 3)
-        # and the values are right, not just the count
-        for hx in hashed:
-            self.assertIn(
-                (real(hx),), db.query(
-                    "SELECT script_hash FROM vout WHERE script_hex=?", (hx,)))
-
-    def indexes_on(self, db, table):
-        return sorted(r[0] for r in db.query(
-            "SELECT name FROM sqlite_master WHERE type='index' AND tbl_name=?",
-            (table,)))
-
-    def _demote_to_redundant_indexes(self):
-        """Recreate the database these indexes came from: both present, neither
-        meta flag set."""
-        for sql in ("CREATE INDEX idx_addr_out_address ON addr_out(address)",
-                    "CREATE INDEX idx_vout_address ON vout(addresses)"):
-            self.db.conn.execute(sql)
-        self.db.conn.execute(
-            "DELETE FROM meta WHERE key IN"
-            " ('addr_out_address_index','vout_address_index')")
-        self.db.conn.commit()
-        self.db.conn.close()
+    def test_all_indexes_is_the_set_the_schema_creates(self):
+        # The bulk loader drops ALL_INDEXES before a COPY and puts them back
+        # after, so a list that drifts from the DDL is a reorg path that comes
+        # back unindexed. It drifted once and nothing noticed; deriving both
+        # from SCHEMA is the fix, and this is the assertion that keeps them
+        # derived.
+        declared = [s for s in db_module.SCHEMA
+                    if s.lstrip().upper().startswith("CREATE INDEX")]
+        self.assertEqual(sorted(db_module.ALL_INDEXES), sorted(declared))
 
     def test_neither_redundant_index_is_created(self):
         # addr_out's key is (address, txid, n), so the address prefix is already
         # seekable and a second index on it stores that column twice. vout's
-        # addresses is a JSON array no query filters on.
-        self.assertEqual(self.indexes_on(self.db, "addr_out"),
-                         ["idx_addr_out_addr", "idx_addr_out_txid_n",
-                          "sqlite_autoindex_addr_out_1"])
+        # addresses is a JSON array no query filters on. Neither is in SCHEMA,
+        # so neither is ever created -- there is no build that could have them.
+        self.assertEqual(indexes_on(self.db, "addr_out"),
+                         ["addr_out_pkey", "idx_addr_out_addr",
+                          "idx_addr_out_txid_n"])
         # idx_vout_script supersedes idx_vout_script_hash: it leads with the same
         # column, so it answers everything the plain one did and the balance
         # query besides, and keeping both would double the write cost of every
         # output for no plan that the covering one cannot serve.
-        self.assertEqual(self.indexes_on(self.db, "vout"),
-                         ["idx_vout_script", "sqlite_autoindex_vout_1"])
+        self.assertEqual(indexes_on(self.db, "vout"),
+                         ["idx_vout_script", "vout_pkey"])
 
     def test_the_balance_lookup_is_served_by_the_covering_index(self):
         # Why the covering index leads with value and not just address: the
@@ -1050,125 +961,324 @@ class MigrationTest(DBTestCase):
         # line -- a plain address index would be a seek, and a seek is what this
         # replaced.
         self.db.add_tx(tx("A", 100, [("addr0", POKE, 1)], coinbase=True))
-        plans = [r[-1] for r in self.db.conn.execute(
-            "EXPLAIN QUERY PLAN SELECT COALESCE(SUM(value),0) FROM addr_out"
-            " WHERE address = ?", ("addr0",))]
-        self.assertTrue(any("COVERING INDEX idx_addr_out_addr" in p
-                            for p in plans), plans)
-        self.assertFalse(any("idx_addr_out_address" in p for p in plans), plans)
-        # Same for the script side, and for the spent half, which used to be the
-        # expensive one: it must not mention vin or txs at all now.
-        spent_plans = [r[-1] for r in self.db.conn.execute(
-            "EXPLAIN QUERY PLAN SELECT COALESCE(SUM(value),0) FROM addr_out"
-            " WHERE address = ? AND (spent_by & 1)", ("addr0",))]
-        self.assertTrue(any("COVERING INDEX idx_addr_out_addr" in p
+        # VACUUM first: an Index Only Scan also needs the page marked
+        # all-visible in the visibility map, and only VACUUM sets that. Without
+        # it Postgres uses a Bitmap Heap Scan, which is correct but still does a
+        # row fetch per match -- the opposite of what this asserts.
+        # Autocommit makes the VACUUM legal, since it cannot run in a
+        # transaction block.
+        self.db.conn.execute("VACUUM")
+        with force_index_use(self.db):
+            plans = [r[-1] for r in self.db.conn.execute(
+                "EXPLAIN SELECT COALESCE(SUM(value),0) FROM addr_out"
+                " WHERE address = ?", ("addr0",))]
+            self.assertTrue(any("Index Only Scan using idx_addr_out_addr" in p
+                                for p in plans), plans)
+            self.assertFalse(any("idx_addr_out_address" in p for p in plans),
+                             plans)
+            # Same for the script side, and for the spent half, which used to be
+            # the expensive one: it must not mention vin or txs at all now.
+            spent_plans = [r[-1] for r in self.db.conn.execute(
+                "EXPLAIN SELECT COALESCE(SUM(value),0) FROM addr_out"
+                " WHERE address = ? AND (spent_by & 1) <> 0", ("addr0",))]
+        self.assertTrue(any("Index Only Scan using idx_addr_out_addr" in p
                             for p in spent_plans), spent_plans)
         self.assertFalse(any(" txs" in p or " vin" in p for p in spent_plans),
                          spent_plans)
 
-    def test_an_existing_database_loses_both_of_them(self):
-        # A fresh schema alone would not remove them: CREATE INDEX IF NOT EXISTS
-        # never drops anything, so an indexer that ran before this change keeps
-        # both indexes until something migrates it.
-        self._demote_to_redundant_indexes()
-        db = self.fresh_db(self.db_path)
-        self.assertEqual(self.indexes_on(db, "addr_out"),
-                         ["idx_addr_out_addr", "idx_addr_out_txid_n",
-                          "sqlite_autoindex_addr_out_1"])
-        self.assertEqual(self.indexes_on(db, "vout"),
-                         ["idx_vout_script", "sqlite_autoindex_vout_1"])
-        for _, flag in DB.REDUNDANT_INDEXES:
-            self.assertEqual(db.get_meta(flag), "dropped")
+    def test_a_freshly_built_table_has_nothing_to_backfill(self):
+        # The property the rebuild policy rests on. Adding a column used to
+        # mean ALTER TABLE ... ADD COLUMN with a default and a separate
+        # backfill; between the two, spent_by read 0 -- "unspent" -- for every
+        # output, so the balance queries reported the entire supply to every
+        # address. There is no window now: a new column is declared in SCHEMA,
+        # and every row in the table was written by code that knew about it.
+        cols = {r[0] for r in self.db.conn.execute(
+            "SELECT column_name FROM information_schema.columns"
+            " WHERE table_schema=current_schema() AND table_name='vout'")}
+        self.assertEqual(cols, {
+            "txid", "n", "value", "type", "addresses", "req_sigs",
+            "script_asm", "script_hex", "script_hash", "mempool", "spent_by"})
 
-    def test_dropping_them_costs_no_scripts_rebuild(self):
-        # Why the drops are keyed on their own meta flags: schema_version drives
-        # a full rebuild_scripts(), which has no business running to reclaim
-        # indexes on an up-to-date database.
-        self.db.add_tx(tx("A", 100, [("addr0", POKE, 1)], coinbase=True))
-        self._demote_to_redundant_indexes()
-        with mock.patch.object(DB, "rebuild_scripts") as rebuild:
-            db = self.fresh_db(self.db_path)
-        rebuild.assert_not_called()
-        self.assertNotIn("idx_vout_address", self.indexes_on(db, "vout"))
-        self.assertEqual(
-            db.address_balances("addr0")["confirmed"]["n_outputs"], 1)
+    def test_each_output_is_hashed_once_on_the_write_path(self):
+        # script_hash_of is SHA256+RIPEMD160, so hashing the same script twice
+        # is the difference between one hash and two per output across a whole
+        # chain. The backfill that used to be able to get this wrong is gone;
+        # this pins the write path, which is the only place it happens now.
+        real = db_module.script_hash_of
+        calls = []
 
-    def test_v1_counters_are_rebuilt_not_trusted(self):
-        """A pre-v3 table's counters were derived data: discard, recompute."""
-        self.db.add_tx(tx("A", 100, [("addr0", POKE, 1)], coinbase=True))
-        self.db.add_tx(tx("B", None, [("addr1", 9 * POKE // 10, 2)],
-                          spends=[("A", 0)]))
-        self.db.conn.execute("DROP TABLE scripts")
-        self.db.conn.execute(
-            """CREATE TABLE scripts (
-                 script_hash TEXT PRIMARY KEY, type TEXT, req_sigs INTEGER,
-                 addresses TEXT, value_received INTEGER DEFAULT 0,
-                 value_spent INTEGER DEFAULT 0, n_vout INTEGER DEFAULT 0,
-                 n_spent INTEGER DEFAULT 0, created_height INTEGER,
-                 last_height INTEGER)""")
-        self.db.conn.execute(
-            "INSERT INTO scripts VALUES (?,?,?,?,999,777,9,9,100,100)",
-            (script_hash_of(script_hex(1)), "pubkeyhash", 1, '["addr0"]'))
-        self.db.conn.execute("UPDATE meta SET value='scripts_v2' "
-                             "WHERE key='schema_version'")
-        # add_tx fills script_hash in; clear it so the backfill has work to do.
-        self.db.conn.execute("UPDATE vout SET script_hash=NULL")
+        def counting(hx):
+            calls.append(hx)
+            return real(hx)
+
+        tags = (0x11, 0x22, 0x33, 0x44)
+        with mock.patch.object(db_module, "script_hash_of", counting):
+            for i, tag in enumerate(tags):
+                self.db.add_tx(tx(chr(ord("A") + i), 100 + i,
+                                  [("addr%d" % i, POKE, tag)], coinbase=True))
+        # Once per output, and no script hashed twice: script_hex gives each tag
+        # its own script, so four outputs are four distinct scripts.
+        self.assertEqual(sorted(calls),
+                         sorted(script_hex(t) for t in tags))
+        self.assertEqual(len(calls), len(set(calls)))
+        for hx in set(calls):
+            self.assertIn(
+                (real(hx),), self.db.query(
+                    "SELECT script_hash FROM vout WHERE script_hex=?", (hx,)))
+
+
+class RebuildTest(DBTestCase):
+    """A shape change discards the chain instead of being migrated in place.
+
+    The policy is DB._rebuild, and the property it has to hold is that it never
+    half-applies. What it replaced could: a migration that added a column with
+    a default and left it unbackfilled produced a database that read as correct
+    and answered every balance with the whole supply. A rebuild cannot reach
+    that state, because it either keeps a database whose shape is already right
+    or empties the database entirely.
+    """
+
+    def _index_three(self):
+        from indexer import Block
+        for i, (addr, val) in enumerate((("addr0", 1), ("addr1", 2),
+                                        ("addr2", 3))):
+            self.db.add_block(Block({"height": 100 + i,
+                                     "hash": "b%d" % (100 + i),
+                                     "time": 1, "tx": []}))
+            self.db.add_tx(tx(chr(ord("A") + i), 100 + i, [(addr, POKE, val)],
+                              coinbase=True))
+        self.db.conn.commit()
+
+    def _set_fingerprint(self, value):
+        if value is None:
+            self.db.conn.execute(
+                "DELETE FROM meta WHERE key=?", (db_module.FINGERPRINT_KEY,))
+        else:
+            self.db.conn.execute(
+                "INSERT INTO meta(key, value) VALUES(?,?)"
+                " ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                (db_module.FINGERPRINT_KEY, value))
         self.db.conn.commit()
         self.db.conn.close()
 
-        db = self.fresh_db(self.db_path)
-        self.assertEqual(db.get_meta("schema_version"), DB.SCHEMA_VERSION)
-        self.assertNotIn(
-            "value_received",
-            [r[1] for r in db.query("PRAGMA table_info(scripts)")])
-        b = Explorer(db).script(script_hash_of(script_hex(1)))
-        self.assertEqual(b["confirmed"]["value_received"], POKE)
-        self.assertEqual(b["live"]["value_spent"], POKE)
-        self.assertEqual(b["created_height"], 100)
+    def _row_counts(self, db):
+        return {t: db.conn.execute("SELECT COUNT(*) FROM %s" % t).fetchone()[0]
+                for t in db_module.SCHEMA_TABLES if t != "meta"}
 
-    def test_reopening_a_migrated_db_is_a_no_op(self):
-        path = self.db_path
-        self.db.conn.close()
-        db = self.fresh_db(path)
-        self.assertEqual(db.get_meta("schema_version"), DB.SCHEMA_VERSION)
-        db.conn.close()
-        again = self.fresh_db(path)
-        self.assertEqual(again.get_meta("schema_version"), DB.SCHEMA_VERSION)
+    def test_a_matching_fingerprint_keeps_the_chain(self):
+        # The case that runs on every start after the first. If this ever
+        # emptied the database, every restart would cost a full reindex.
+        self._index_three()
+        self._set_fingerprint(db_module.SCHEMA_FINGERPRINT)
+        db = self.reopened(rebuild=True)
+        self.assertEqual(self._row_counts(db),
+                         {"blocks": 3, "txs": 3, "vin": 3, "vout": 3,
+                          "addr_out": 3, "scripts": 3})
+        self.assertEqual(db.tip_height(), 102)
+        for key, sql in db_module.STATS:
+            self.assertEqual(db._stat(key),
+                             db.conn.execute(sql).fetchone()[0], key)
+
+    def test_a_stale_fingerprint_empties_the_chain(self):
+        # What a code change does. The database is thrown away and the indexer
+        # re-syncs from genesis, which costs minutes and is always correct.
+        self._index_three()
+        self._set_fingerprint("0000000000000000")
+        db = self.reopened(rebuild=True)
+        self.assertEqual(set(self._row_counts(db).values()), {0})
+        self.assertEqual(db.tip_height(), -1)
+        # The counters went with the rows, not left describing a chain that is
+        # no longer there -- that mismatch is what reports a supply figure for
+        # an empty database.
+        self.assertEqual(db._stat(db_module.COINBASE_TOTAL_KEY), 0)
+        self.assertEqual(db._stat(db_module.N_BLOCKS_KEY), 0)
+        self.assertEqual(db._stat(db_module.N_TXS_KEY), 0)
+
+    def test_a_database_with_no_fingerprint_is_emptied(self):
+        # Every database built before this policy existed, and every one a
+        # failed build left behind. Nothing can be promised about their shape,
+        # so they are rebuilt rather than inspected.
+        self._index_three()
+        self._set_fingerprint(None)
+        db = self.reopened(rebuild=True)
+        self.assertEqual(set(self._row_counts(db).values()), {0})
+        self.assertEqual(db.tip_height(), -1)
+
+    def test_the_web_side_can_never_empty_the_chain(self):
+        # rebuild=False is what the web server opens with, so a schema mismatch
+        # cannot cost a running site its indexed chain. It also does not repair
+        # the mismatch -- that is the indexer's job, and the two processes are
+        # expected to disagree about it briefly at startup.
+        self._index_three()
+        self._set_fingerprint("0000000000000000")
+        db = self.reopened(rebuild=False)
+        self.assertEqual(self._row_counts(db)["blocks"], 3)
+        self.assertEqual(db.get_meta(db_module.FINGERPRINT_KEY),
+                         "0000000000000000")
+
+    def test_a_rebuild_removes_our_orphaned_index_but_not_a_foreign_table(self):
+        # Two kinds of leftover, and the rebuild has to answer them differently.
+        # An index on a table the schema owns goes with the table and is not
+        # recreated, because CREATE TABLE IF NOT EXISTS never drops anything and
+        # an index the schema no longer names would otherwise cost write time
+        # on every block forever, with nothing to notice it. A table the schema
+        # never named is left alone: it is not this schema's to delete, and a
+        # rebuild that swept up unknown tables could destroy something that
+        # merely shares the database.
+        self._index_three()
+        self.db.conn.execute("CREATE TABLE notes (x INTEGER)")
+        self.db.conn.execute(
+            "CREATE INDEX idx_vout_address ON vout(addresses)")
+        self.db.conn.commit()
+        self._set_fingerprint("0000000000000000")
+        db = self.reopened(rebuild=True)
+        self.assertEqual(indexes_on(db, "vout"), ["idx_vout_script", "vout_pkey"])
+        self.assertEqual(indexes_on(db, "addr_out"),
+                         ["addr_out_pkey", "idx_addr_out_addr",
+                          "idx_addr_out_txid_n"])
+        present = sorted(r[0] for r in db.conn.execute(
+            "SELECT tablename FROM pg_tables WHERE schemaname=current_schema()"))
+        self.assertIn("notes", present)
+        self.assertEqual([t for t in present if t != "notes"],
+                         ["addr_out", "blocks", "meta", "scripts",
+                          "txs", "vin", "vout"])
+
+    def test_a_failed_open_closes_the_connection_it_cannot_return(self):
+        # A constructor that raises never hands back the object holding the
+        # connection, so nothing downstream can close it. Covered here because
+        # the failure is otherwise only visible as a ResourceWarning, which a
+        # normal run does not surface and so lets the gap sit unnoticed.
+        #
+        # The failure is injected at _rebuild because that is the shape that
+        # matters and the one the constructor cannot recover from by itself.
+        opened = []
+        real_connect = psycopg.connect
+
+        def spy(*a, **kw):
+            conn = real_connect(*a, **kw)
+            opened.append(conn)
+            return conn
+
+        dsn = self.add_schema_dsn()
+        with mock.patch.object(db_module.psycopg, "connect", spy), \
+             mock.patch.object(DB, "_rebuild",
+                               side_effect=psycopg.OperationalError("boom")):
+            with self.assertRaises(psycopg.OperationalError):
+                DB.initialize(dsn, rebuild=True)
+        self.assertEqual(len(opened), 1)
+        # A closed connection refuses work, which is how this is asked without
+        # depending on the warning the fix exists to prevent.
+        with self.assertRaises(psycopg.OperationalError):
+            opened[0].execute("SELECT 1")
+
+
+class ColdStartRaceTest(_PGTestCase):
+    """Two cold starts at once must not collide while creating the schema.
+
+    explorer.sh launches the indexer and the web server together, and on a
+    database built from scratch both reach initialize() within a second of
+    each other with the schema still empty. CREATE TABLE IF NOT EXISTS is not
+    race-safe in PostgreSQL -- the existence check and the catalog insert are
+    not one atomic act -- so without the schema lock covering the DDL loop
+    one of them dies with a pg_type collision on the very first table. That is
+    not a cosmetic failure: the loser was the web server, and it died before
+    binding, so the browser got connection-refused until the second run.
+    """
+
+    def initialize_concurrently(self, dsn, n=4):
+        """Call DB.initialize() `n` times at once; return the errors raised.
+
+        Real threads, not one after another: the collision only happens when
+        the CREATE TABLEs actually overlap, and a serial loop would pass
+        against the unfixed code.
+        """
+        errors = []
+        start = threading.Barrier(n)
+        made = []
+
+        def run():
+            start.wait(60)          # release them all into the DDL together
+            try:
+                db = DB.initialize(dsn)
+                made.append(db)
+            except Exception as e:  # noqa: BLE001 - the failure is the subject
+                errors.append(e)
+
+        threads = [threading.Thread(target=run) for _ in range(n)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(120)
+        for db in made:
+            self.addCleanup(db.conn.close)
+        return errors
+
+    def test_a_cold_start_race_loses_nobody(self):
+        dsn = self.add_schema_dsn()
+        errors = self.initialize_concurrently(dsn)
+        self.assertEqual([str(e) for e in errors], [])
+        # And the schema it built is the one every later process expects.
+        db = DB.connect(dsn)
+        self.addCleanup(db.conn.close)
+        self.assertEqual(
+            tables_in(db),
+            {"meta", "blocks", "txs", "vin", "vout", "addr_out", "scripts"})
+
+    def test_the_race_leaves_no_half_built_schema_behind(self):
+        # A loser that rolled back mid-DDL would leave some tables and not
+        # others. Every table, or the failure is worse than the collision.
+        dsn = self.add_schema_dsn()
+        self.initialize_concurrently(dsn, n=6)
+        with contextlib.closing(psycopg.connect(dsn, autocommit=True)) as raw:
+            names = {r[0] for r in raw.execute(
+                "SELECT table_name FROM information_schema.tables "
+                "WHERE table_schema = current_schema()")}
+        self.assertEqual(
+            names,
+            {"meta", "blocks", "txs", "vin", "vout", "addr_out", "scripts"})
+
+    def test_two_racing_cold_starts_agree_on_the_result(self):
+        # Whoever created what, both callers must end up able to read and
+        # write it: a schema one of them considers unfinished is the other
+        # failure mode of this race.
+        dsn = self.add_schema_dsn()
+        self.initialize_concurrently(dsn, n=2)
+        from indexer import Block
+        db = DB.initialize(dsn)
+        self.addCleanup(db.conn.close)
+        db.add_block(Block({"height": 1, "hash": "b1", "time": 1, "tx": []}))
+        db.add_tx(tx("T1", 1, [("a", POKE, 1)], coinbase=True))
+        self.assertEqual(db.query("SELECT count(*) FROM txs")[0][0], 1)
 
 
 class ConnectionSetupTest(DBTestCase):
     """initialize() owns DDL; connect() must never run it."""
 
     def tables(self, db):
-        return {r[0] for r in db.query(
-            "SELECT name FROM sqlite_master WHERE type='table'")}
+        return tables_in(db)
 
     def test_connect_creates_no_schema(self):
-        path = os.path.join(self._new_dir(), "cold.db")
-        self.assertFalse(os.path.exists(path))
-        db = DB.connect(path)          # read side on a DB that does not exist
-        self.addCleanup(db.conn.close)
-        self.assertEqual(self.tables(db), set())  # nothing was created
+        dsn = self.add_schema_dsn()
+        self.assertEqual(tables_in(DB.connect(dsn)), set())
 
-    def test_connect_does_not_migrate_an_old_db(self):
-        # A v2 database opened through connect() keeps its old shape: the read
-        # path must not rewrite the schema the indexer owns.
-        path = os.path.join(self._new_dir(), "old.db")
-        self.db.conn.close()
-        # closing(), not `with`: sqlite3's context manager ends a transaction,
-        # it does not close the connection.
-        with contextlib.closing(sqlite3.connect(path)) as raw:
-            raw.executescript("CREATE TABLE meta (key TEXT PRIMARY KEY,"
-                              " value TEXT)")
-            raw.execute("INSERT INTO meta VALUES ('schema_version','v2')")
+    def test_connect_does_not_rewrite_a_schema_it_does_not_own(self):
+        # A database opened through connect() keeps whatever shape it has, even
+        # one this code would reject: the read path must neither rebuild it nor
+        # repair it, because the indexer owns that decision and the two are
+        # expected to disagree about it briefly at startup.
+        dsn = self.add_schema_dsn()
+        # contextlib.closing, not `with`: psycopg's context manager ends the
+        # transaction, it does not close the connection.
+        with contextlib.closing(psycopg.connect(dsn, autocommit=True)) as raw:
+            raw.execute("CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT)")
+            raw.execute("INSERT INTO meta VALUES ('schema_fingerprint','v2')")
             raw.execute("CREATE TABLE scripts (script_hash TEXT PRIMARY KEY,"
                         " value_received INTEGER)")
-            raw.commit()
-        db = DB.connect(path)
+        db = DB.connect(dsn)
         self.addCleanup(db.conn.close)
-        self.assertIn("value_received",
-                      [r[1] for r in db.query("PRAGMA table_info(scripts)")])
-        self.assertEqual(db.get_meta("schema_version"), "v2")
+        self.assertIn("value_received", columns_of(db, "scripts"))
+        self.assertEqual(db.get_meta(db_module.FINGERPRINT_KEY), "v2")
 
     def test_connect_sees_writes_from_another_connection(self):
         db = self.fresh_db(self.db_path)
@@ -1262,51 +1372,77 @@ class PoolTimeoutTest(DBTestCase):
         self.assertIn("n_blocks", out)
 
 
-class BusyTimeoutTest(DBTestCase):
-    """Long only while the schema is being migrated, short afterwards."""
+class LockTimeoutTest(DBTestCase):
+    """Long only while the schema is being built, short afterwards."""
+
+    _UNITS = {"us": 0.001, "ms": 1, "s": 1000, "min": 60_000, "h": 3_600_000,
+              "d": 86_400_000}
 
     def timeout_of(self, db):
-        return db.conn.execute("PRAGMA busy_timeout").fetchone()[0]
+        """lock_timeout, in milliseconds.
+
+        SHOW answers in whichever unit is exact -- "5s" for 5000ms, "30min"
+        for 1800000ms -- so it is parsed back to a number rather than compared
+        as text, which would pin these tests to Postgres's own formatting.
+        The unit has to be matched longest-first: slicing one character off
+        turns "1234ms" into "1234m" and "30min" into "30mi".
+        """
+        raw = db.conn.execute("SHOW lock_timeout").fetchone()[0]
+        m = re.match(r"^([0-9]+(?:\.[0-9]+)?)\s*([a-z]+)$", raw)
+        self.assertIsNotNone(m, "unparsed lock_timeout %r" % raw)
+        number, unit = m.groups()
+        return int(float(number) * self._UNITS[unit])
 
     def test_a_read_connection_waits_seconds_not_minutes(self):
         db = DB.connect(self.db_path)
         self.addCleanup(db.conn.close)
-        self.assertEqual(self.timeout_of(db), DB.NORMAL_BUSY_TIMEOUT_MS)
+        self.assertEqual(self.timeout_of(db), DB.NORMAL_LOCK_TIMEOUT_MS)
         self.assertLess(self.timeout_of(db), 60_000)
 
-    def test_the_migration_window_gets_the_long_timeout(self):
-        # _migrate() must run under the long timeout, and the connection must
+    def test_the_schema_window_gets_the_long_timeout(self):
+        # Schema work must run under the long timeout, and the connection must
         # not keep it afterwards.
         seen = []
-        real = DB._migrate
+        real = DB._rebuild
 
         def spy(inner):
             seen.append(self.timeout_of(inner))
             return real(inner)
 
-        with mock.patch.object(DB, "_migrate", spy):
-            db = DB.initialize(self.db_path)  # already current; still runs
+        with mock.patch.object(DB, "_rebuild", spy):
+            db = DB.initialize(self.db_path, rebuild=True)  # runs regardless
         self.addCleanup(db.conn.close)
-        self.assertEqual(seen, [DB.MIGRATION_BUSY_TIMEOUT_MS])
-        self.assertEqual(self.timeout_of(db), DB.NORMAL_BUSY_TIMEOUT_MS)
+        self.assertEqual(seen, [DB.SCHEMA_LOCK_TIMEOUT_MS])
+        self.assertEqual(self.timeout_of(db), DB.NORMAL_LOCK_TIMEOUT_MS)
 
     def test_an_explicit_timeout_is_honoured(self):
-        db = DB(self.db_path, busy_timeout=1234)
+        db = DB(self.db_path, lock_timeout=1234)
         self.addCleanup(db.conn.close)
         self.assertEqual(self.timeout_of(db), 1234)
 
     def test_a_blocked_write_fails_fast_instead_of_hanging(self):
+        # A row lock rather than a whole-database write lock: the holder takes
+        # one meta row and keeps it, and the waiter blocks behind it there.
+        #
+        # The explicit begin() is what makes it a holder. The connection is in
+        # autocommit, so a bare UPDATE would commit as soon as it ran and drop
+        # the lock again before the waiter ever asked for it -- which is a test
+        # that passes for the wrong reason, not one that does not block.
+        # The fingerprint row, because it is the one row a fresh schema is
+        # guaranteed to have: the counters are no longer seeded on open, so
+        # there is no total_coinbase row to lock until something has minted.
+        row = db_module.FINGERPRINT_KEY
         holder = self.fresh_db(self.db_path)
-        holder.conn.execute("BEGIN EXCLUSIVE")
+        holder.conn.begin()
+        holder.conn.execute("UPDATE meta SET value=value WHERE key=?", (row,))
         self.addCleanup(holder.conn.rollback)
-        waiter = DB(self.db_path, busy_timeout=50)   # 50ms, same code path
+        waiter = DB(self.db_path, lock_timeout=50)   # 50ms, same code path
         self.addCleanup(waiter.conn.close)
-        with self.assertRaises(sqlite3.OperationalError) as cm:
-            for i in range(50):
-                waiter.conn.execute("INSERT OR REPLACE INTO meta VALUES (?,?)",
-                                    ("k%d" % i, str(i)))
-                waiter.conn.commit()
-        self.assertIn("locked", str(cm.exception))
+        with self.assertRaises(psycopg.errors.LockNotAvailable) as cm:
+            waiter.conn.execute(
+                "UPDATE meta SET value=? WHERE key=?", ("x", row))
+            waiter.conn.commit()
+        self.assertIn("lock timeout", str(cm.exception))
 
 
 class ScriptsRebuildTest(DBTestCase):
@@ -1820,12 +1956,18 @@ class MempoolRefreshTest(DBTestCase):
             rows = real(db, sql, params)
             seen.append((sql, list(params),
                          [r[-1] for r in db.conn.execute(
-                             "EXPLAIN QUERY PLAN " + sql, params)], len(rows)))
+                             "EXPLAIN " + sql, params)], len(rows)))
             return rows
 
         with mock.patch.object(DB, "query", spy):
-            self.indexer.rpc = daemon
-            self.indexer.sync_mempool()
+            # Under force_index_use, as the other plan assertions here are: the
+            # property under test is which access path the lookup is served by,
+            # and on a 500-row fixture the planner is free to prefer a seq scan
+            # on cost grounds, which would make this assert on the row count
+            # rather than on the statement.
+            with force_index_use(self.db):
+                self.indexer.rpc = daemon
+                self.indexer.sync_mempool()
         return seen
 
     def test_the_membership_lookup_is_a_primary_key_seek(self):
@@ -1834,9 +1976,13 @@ class MempoolRefreshTest(DBTestCase):
         self.index_confirmed(500)
         for sql, _, plans, _ in self.queries_during(
                 FakeDaemon(499, mempool=["m1", "m2"])):
-            for plan in plans:
-                self.assertNotIn("idx_txs_status_height", plan, sql)
-                self.assertIn("sqlite_autoindex_txs_1", plan, sql)
+            # Joined, not line by line: SQLite's EXPLAIN QUERY PLAN gave one row
+            # per access path, so every line named the index. Postgres EXPLAIN
+            # returns a tree, and only the leaf carries the index name -- the
+            # Bitmap Heap Scan and Hash Join lines above it never mention it.
+            plan = "\n".join(plans)
+            self.assertNotIn("idx_txs_status_height", plan, sql)
+            self.assertIn("txs_pkey", plan, sql)
 
     def test_a_refresh_does_not_read_the_whole_index(self):
         # One query is not the same as a cheap query: the old form asked for
@@ -2016,18 +2162,6 @@ class TotalCoinbaseCacheTest(DBTestCase):
                           [("miner", pokes, 1)], coinbase=True))
         return tag
 
-    def derived(self):
-        """The total as the defining query computes it, ignoring the counter."""
-        return self.db.conn.execute(
-            db_module.TOTAL_COINBASE_SQL).fetchone()[0]
-
-    def assertMatchesDerived(self, msg=""):
-        """Every maintained counter must equal the query that defines it."""
-        for key, sql in db_module.STATS:
-            self.assertEqual(self.db._stat(key),
-                             self.db.conn.execute(sql).fetchone()[0],
-                             "%s: %s" % (key, msg))
-
     def test_a_new_block_is_visible_immediately(self):
         # The old cache held its value for 60s regardless of the chain.
         self.coinbase_block(1, "h1")
@@ -2056,6 +2190,42 @@ class TotalCoinbaseCacheTest(DBTestCase):
         self.assertEqual(self.explorer.total_coinbase(), 100 * POKE)
         self.db.clear_from(2)
         self.assertEqual(self.explorer.total_coinbase(), 50 * POKE)
+
+    def test_a_normal_tx_does_not_mint(self):
+        # Only coinbases mint. A normal tx moves value that already exists, so
+        # indexing one must leave the total exactly where it was. This is the
+        # case the rest of this class cannot see: coinbase_block() indexes
+        # nothing but coinbases, so a counter that counted every confirmed tx's
+        # outputs agreed with the defining query in every one of them.
+        self.coinbase_block(1, "h1")
+        before = self.explorer.total_coinbase()
+        self.assertEqual(before, 50 * POKE)
+        self.db.add_tx(tx("T1", 1, [("alice", 80 * POKE, 1)],
+                          spends=[("C1", 0)]))
+        self.assertEqual(self.explorer.total_coinbase(), before,
+                         "a normal tx was counted as newly minted")
+        self.assertMatchesDerived("after a normal tx")
+
+    def test_many_normal_txs_still_do_not_drift(self):
+        # The gap grows with throughput rather than staying a constant offset, so
+        # one is not enough to catch a regression in the shape of the error.
+        self.coinbase_block(1, "h1")
+        for i in range(40):
+            self.db.add_tx(tx("T%d" % i, 1, [("alice", 7 * POKE, 1)],
+                              spends=[("C1", 0)]))
+        self.assertEqual(self.explorer.total_coinbase(), 50 * POKE)
+        self.assertMatchesDerived("after 40 normal txs")
+
+    def test_a_normal_tx_evicted_from_the_mempool_does_not_move_the_total(self):
+        # The remove path only ever subtracted coinbase values, so the two sides
+        # disagreed: adding counted every tx, subtracting counted only coinbases.
+        self.coinbase_block(1, "h1")
+        before = self.explorer.total_coinbase()
+        self.db.add_tx(tx("M1", None, [("alice", 30 * POKE, 1)], spends=()))
+        self.assertEqual(self.explorer.total_coinbase(), before)
+        self.db.remove_txs(["M1"])
+        self.assertEqual(self.explorer.total_coinbase(), before)
+        self.assertMatchesDerived("after mempool eviction")
 
     def test_the_repeated_value_is_served_from_cache(self):
         # Repeated reads must not run the sum. This is the regression that
@@ -2269,7 +2439,7 @@ class TotalCoinbaseCacheTest(DBTestCase):
         self.assertEqual(s["total_coinbase_pxc"], "100.00000000")
 
 
-class AmountParsingTest(unittest.TestCase):
+class AmountParsingTest(_PGTestCase):
     """Amounts must never pass through a binary float."""
 
     def test_ordinary_amounts(self):
@@ -2382,9 +2552,9 @@ class AmountParsingTest(unittest.TestCase):
 
     # A real header from phoenixcoind (regtest/mainnet alike), captured
     # verbatim. The difficulty value is the reason: parse_float=Decimal makes
-    # it a Decimal, and sqlite3 refuses to bind one, which broke indexing
-    # against a live daemon with "Error binding parameter 8". Every test above
-    # builds its own payload, so none of them saw this.
+    # it a Decimal, and no driver will bind one into a numeric column, which
+    # broke indexing against a live daemon. Every test above builds its own
+    # payload, so none of them saw this.
     REAL_BLOCK = {
         "bits": "1e00c58f", "confirmations": 1, "difficulty": Decimal("0.00506171"),
         "hash": "d88b18ceff594924be801c235a6333ae63312774", "height": 406882,
@@ -2397,9 +2567,7 @@ class AmountParsingTest(unittest.TestCase):
 
     def test_a_real_header_stores_without_a_binding_error(self):
         from indexer import Block
-        d = tempfile.mkdtemp()
-        self.addCleanup(shutil.rmtree, d, ignore_errors=True)
-        db = DB(os.path.join(d, "real.db"))
+        db = DB(self.add_schema_dsn())
         self.addCleanup(db.conn.close)
         b = Block(self.REAL_BLOCK)
         db.add_block(b)          # used to raise on the Decimal difficulty
@@ -2600,3 +2768,226 @@ class RecentBlocksTest(DBTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class BulkWindowHazardTest(DBTestCase):
+    """What may not happen to writes still sitting in an open bulk window.
+
+    add_tx no longer writes as it goes. Inside `bulk()` a tx's rows, its
+    spent-flag refresh and its counter deltas are all held back and written
+    once at the end, which is where the speed came from -- and it means the
+    window can be caught mid-flight by something that assumes the table
+    already holds what it just handed over. These are the ways that can
+    happen, each of which the buffering has to get right:
+
+      - the same txid indexed twice in one window (last one must win, and
+        must not collide with its own buffered rows);
+      - a reorg truncating the chain from inside the window;
+      - a mempool eviction removing rows added in this same window;
+      - a read of the table or of a counter before the window closes;
+      - the window raising, which must leave nothing behind.
+
+    A wrong answer here is silent -- a doubled balance, a supply that drifts,
+    rows resurrected by a truncation -- so each case is checked against the
+    derived query as well as against a literal.
+    """
+
+    def block(self, height, tag=None):
+        from indexer import Block
+        tag = tag or "b%d" % height
+        self.db.add_block(Block({"height": height, "hash": tag,
+                                 "time": 1700000000 + height, "tx": []}))
+        return tag
+
+    def test_buffered_rows_reach_the_table_when_the_window_closes(self):
+        # The rows are held in memory until the flush, so the table does not
+        # have them yet -- that is the whole of what makes this fast. What has
+        # to be true is that they arrive, complete, at commit.
+        with self.db.bulk():
+            self.block(1)
+            self.db.add_tx(tx("T1", 1, [("a", 10 * POKE, 0)], [("prev", 0)]))
+            self.assertEqual(
+                self.db.conn.execute(
+                    "SELECT count(*) FROM txs WHERE txid='T1'").fetchone()[0], 0)
+        for table in ("txs", "vin", "vout"):
+            self.assertEqual(
+                self.db.conn.execute(
+                    "SELECT count(*) FROM %s WHERE txid='T1'" % table
+                ).fetchone()[0], 1, table)
+        self.assertMatchesDerived("after the window committed")
+
+    def test_an_uncommitted_window_is_invisible_to_another_connection(self):
+        # Work in flight is not chain yet. A second connection must not see a
+        # block the first is still indexing, or a reader would serve a chain
+        # tip that a failed sync then rolls back.
+        other = psycopg.connect(self.db_path, autocommit=True)
+        self.addCleanup(other.close)
+        with self.db.bulk():
+            self.block(1)
+            self.db.add_tx(tx("T1", 1, [("a", 10 * POKE, 0)], [("prev", 0)]))
+            self.assertEqual(other.execute(
+                "SELECT count(*) FROM blocks").fetchone()[0], 0)
+            self.assertEqual(other.execute(
+                "SELECT count(*) FROM txs WHERE txid='T1'").fetchone()[0], 0)
+        self.assertEqual(other.execute(
+            "SELECT count(*) FROM txs WHERE txid='T1'").fetchone()[0], 1)
+
+    def test_a_window_that_raises_leaves_nothing_behind(self):
+        self.block(1)
+        with self.assertRaises(RuntimeError):
+            with self.db.bulk():
+                self.db.add_tx(tx("T1", 1, [("a", 10 * POKE, 0)],
+                                  [("prev", 0)]))
+                raise RuntimeError("sync aborted mid-window")
+        self.assertEqual(
+            self.db.conn.execute(
+                "SELECT count(*) FROM txs WHERE txid='T1'").fetchone()[0], 0)
+        self.assertEqual(self.db.conn.execute(
+            "SELECT count(*) FROM vout WHERE txid='T1'").fetchone()[0], 0)
+        self.assertMatchesDerived("after a rolled-back window")
+
+    def test_the_same_txid_twice_in_one_window_keeps_only_the_last(self):
+        # Re-index: the second add_tx replaces the first outright. Buffered
+        # rows are keyed by txid for this -- two buffered versions of one txid
+        # would insert twice and collide on the primary key, or leave the old
+        # rows behind to be counted twice.
+        self.block(1)
+        self.db.add_tx(tx("T1", 1, [("a", 10 * POKE, 0)], [("prev", 0)]))
+        with self.db.bulk():
+            self.db.add_tx(tx("T1", 1, [("b", 20 * POKE, 1)], [("prev", 0)]))
+            self.db.add_tx(tx("T1", 1, [("c", 30 * POKE, 2)], [("prev", 0)]))
+        self.assertEqual(self.db.conn.execute(
+            "SELECT count(*) FROM txs WHERE txid='T1'").fetchone()[0], 1)
+        self.assertEqual(self.db.conn.execute(
+            "SELECT count(*) FROM vout WHERE txid='T1'").fetchone()[0], 1)
+        self.assertEqual(json.loads(self.db.conn.execute(
+            "SELECT addresses FROM vout WHERE txid='T1'").fetchone()[0]),
+            ["c"])
+        self.assertMatchesDerived("after a double re-index in one window")
+
+    def test_a_read_inside_the_window_sees_the_rows_handed_to_it(self):
+        # A read inside the window would otherwise see the table without the
+        # rows still sitting in the buffer, and answer as if the block never
+        # arrived.
+        self.block(1)
+        with self.db.bulk():
+            self.db.add_tx(tx("T1", 1, [("a", 10 * POKE, 0)], [("prev", 0)]))
+            self.assertEqual(
+                self.db.query("SELECT count(*) FROM vout WHERE txid='T1'"
+                              )[0][0], 1)
+            self.assertEqual(
+                self.db.query("SELECT count(*) FROM vin WHERE txid='T1'"
+                              )[0][0], 1)
+
+    def test_a_counter_read_inside_the_window_sees_the_window(self):
+        # Same hazard on the maintained counters: reading n_blocks with the
+        # block still buffered would answer the height from before it.
+        self.assertEqual(self.db.n_blocks(), 0)
+        with self.db.bulk():
+            self.block(1)
+            self.assertEqual(self.db.n_blocks(), 1)
+        self.assertEqual(self.db.n_blocks(), 1)
+
+    def test_a_reorg_from_inside_the_window_truncates_what_the_window_wrote(self):
+        # The dangerous one. A reorg calls clear_from while the window still
+        # holds rows for the very blocks being truncated. If the truncation ran
+        # first and the buffer flushed after, the flush would re-insert the
+        # rows the truncation just removed, inside the same transaction.
+        for h in (1, 2, 3):
+            self.block(h)
+            self.db.add_tx(tx("T%d" % h, h, [("a", h * POKE, 0)], [("prev", 0)]))
+        self.assertEqual(self.db.n_blocks(), 3)
+        with self.db.bulk():
+            self.block(4)
+            self.db.add_tx(tx("T4", 4, [("a", 4 * POKE, 0)], [("prev", 0)]))
+            self.db.clear_from(3)
+        self.assertEqual(self.db.n_blocks(), 2)
+        # A truncated confirmed tx becomes a tombstone, not a deletion: the rows
+        # that would leak into address queries are severed, the tx stays.
+        self.assertEqual(self.db.conn.execute(
+            "SELECT status FROM txs WHERE txid='T4'").fetchone()[0],
+            "orphaned")
+        for table in ("vin", "vout", "addr_out"):
+            self.assertEqual(
+                self.db.conn.execute(
+                    "SELECT count(*) FROM %s WHERE txid='T4'" % table
+                ).fetchone()[0], 0, table)
+        self.assertMatchesDerived("after an in-window reorg")
+
+    def test_an_eviction_from_inside_the_window_removes_what_the_window_wrote(self):
+        # A mempool tx added in this window, then evicted before it closed: it
+        # must end up gone, not re-inserted by the flush.
+        with self.db.bulk():
+            self.block(1)
+            self.db.add_tx(tx("C1", 1, [("miner", 50 * POKE, 0)], coinbase=True))
+            self.db.add_tx(tx("M1", None, [("pay", 7 * POKE, 0)], [("C1", 0)]))
+            self.assertEqual(self.db.total_coinbase(), 50 * POKE)
+            self.db.remove_txs(["M1"])
+        self.assertEqual(
+            self.db.conn.execute(
+                "SELECT count(*) FROM txs WHERE txid='M1'").fetchone()[0], 0)
+        self.assertEqual(self.db.total_coinbase(), 50 * POKE)
+        # The coinbase the evicted tx was spending is unspent again, not left
+        # marked spent by a spender that no longer exists.
+        self.assertEqual(self.spent_by("C1", 0), 0)
+        self.assertMatchesDerived("after an in-window eviction")
+
+    def test_a_spend_chain_added_in_one_window_marks_spent_across_it(self):
+        # The spent flags are derived by an EXISTS over the vin table, so
+        # deferring them is only safe if they see every tx in the window, not
+        # only the ones written before the flush started. Two txs where the
+        # second spends the first is the case that would break: A->B added in
+        # one window must leave A's output spent by B, exactly as if each add
+        # had committed on its own.
+        with self.db.bulk():
+            for h in (1, 2, 3):
+                self.block(h)
+                self.db.add_tx(tx("C%d" % h, h, [("miner", 50 * POKE, 0)],
+                                  coinbase=True))
+            self.db.add_tx(tx("P1", 2, [("a", 7 * POKE, 0)], [("C1", 0)]))
+            self.db.add_tx(tx("P2", 3, [("b", 7 * POKE, 1)], [("P1", 0)]))
+        self.assertEqual(self.spent_by("C1", 0), 1)
+        self.assertEqual(self.spent_by("P1", 0), 1)
+        self.assertMatchesDerived("after a chained window")
+
+    def test_the_same_window_written_twice_over_reaches_the_same_state(self):
+        # The property that actually matters: the window is an optimisation,
+        # so it must not change the answer. Index a chain in one transaction
+        # and again tx by tx, and the two databases must agree completely --
+        # rows, flags and counters.
+        from indexer import Block
+
+        def chain(conn_db):
+            for h in (1, 2, 3):
+                conn_db.add_block(Block({"height": h, "hash": "b%d" % h,
+                                        "time": 1, "tx": []}))
+                conn_db.add_tx(tx("C%d" % h, h, [("miner", 50 * POKE, 0)],
+                                  coinbase=True))
+            conn_db.add_tx(tx("P1", 2, [("a", 7 * POKE, 0)], [("C1", 0)]))
+            conn_db.add_tx(tx("P2", 3, [("b", 7 * POKE, 1)], [("P1", 0)]))
+            # And a re-index of P1 in place, which is the case the txid keying
+            # of the buffer exists for.
+            conn_db.add_tx(tx("P1", 2, [("z", 9 * POKE, 2)], [("C1", 0)]))
+
+        bulk_db = self.fresh_db()
+        with bulk_db.bulk():
+            chain(bulk_db)
+        chain(self.db)
+
+        for sql in ("SELECT * FROM txs ORDER BY txid",
+                    "SELECT * FROM vout ORDER BY txid, n",
+                    "SELECT * FROM vin ORDER BY txid, n",
+                    "SELECT * FROM addr_out ORDER BY address, txid, n",
+                    "SELECT * FROM blocks ORDER BY height"):
+            self.assertEqual(bulk_db.conn.execute(sql).fetchall(),
+                             self.db.conn.execute(sql).fetchall(), sql)
+        self.assertEqual(bulk_db.total_coinbase(), self.db.total_coinbase())
+        self.assertEqual(bulk_db.n_blocks(), self.db.n_blocks())
+        def flag(conn_db, sig, n):
+            rows = conn_db.query(
+                "SELECT spent_by FROM addr_out WHERE txid=? AND n=?", (sig, n))
+            return None if not rows else rows[0][0]
+        for sig in ("C1", "C2", "C3", "P1", "P2"):
+            for n in (0, 1):
+                self.assertEqual(flag(bulk_db, sig, n), flag(self.db, sig, n),
+                                 "%s:%d" % (sig, n))

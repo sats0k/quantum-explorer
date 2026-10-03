@@ -1,7 +1,10 @@
 """Read-only JSON API + static frontend for the PhoenixCoin Quantum explorer.
 
 Usage:
-    python3 server.py [db-path] [--port 8080]
+    python3 server.py [dsn] [--port 8080]
+
+`dsn` is a libpq connection string (see the libpq docs); it defaults to
+$EXPLORER_DSN, then to "dbname=explorer".
 
 Endpoints:
     GET /api/summary              tip height/hash, counts
@@ -30,12 +33,13 @@ import os
 import queue
 import signal
 import socket
-import sqlite3
 import sys
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse
 
-from db import DB, COIN, TOTAL_COINBASE_SQL
+import psycopg
+
+from db import DB, COIN, DEFAULT_DSN, TOTAL_COINBASE_SQL
 
 WEB_ROOT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "web")
 
@@ -61,6 +65,16 @@ def poke(v):
     return "%s%d.%08d" % ("-" if neg else "", whole, frac)
 
 
+def _is_height(ref):
+    """True if a URL path segment is a block height rather than a hash.
+
+    ASCII digits only: str.isdigit() also accepts the Unicode digit forms
+    ('²' and friends), and int() would then take a different path than the one
+    this is deciding about.
+    """
+    return ref.isascii() and ref.isdigit()
+
+
 def with_hex(balances):
     """Add the *_hex display form to a balance dict, in place."""
     for key in ("value_received", "value_spent", "balance"):
@@ -81,12 +95,10 @@ class DBPool:
     ThreadingHTTPServer starts a thread per request, so a per-thread connection
     would be no better than one per request; a bounded pool is what actually
     amortises the connect cost. Sized for concurrent readers, not for CPU: the
-    queries are index-driven and short, and SQLite serialises writes anyway
-    (the indexer owns those).
+    queries are index-driven and short, and the indexer owns the writes.
 
-    Connections are opened here, once, with check_same_thread=False, so a
-    connection can be used by whichever thread borrows it. Checkout is what
-    keeps that safe, not the flag.
+    Connections are opened here, once, so a connection can be used by whichever
+    thread borrows it. Checkout is what keeps that safe.
 
     A borrow must not nest: a handler that needed two connections at once would
     wait for itself once the pool is empty. Nothing here does, and the
@@ -96,9 +108,9 @@ class DBPool:
     503 once the pool stays exhausted, instead of a thread waiting forever.
     """
 
-    def __init__(self, path, size=4):
+    def __init__(self, dsn, size=4):
         self._free = queue.LifoQueue()
-        self._all = [DB.connect(path) for _ in range(size)]
+        self._all = [DB.connect(dsn) for _ in range(size)]
         for db in self._all:
             self._free.put(db)
 
@@ -116,7 +128,7 @@ class DBPool:
         for db in self._all:
             try:
                 db.conn.close()
-            except sqlite3.Error:
+            except psycopg.Error:
                 pass
 
 
@@ -150,7 +162,7 @@ class Explorer:
         # The two counts and the supply are read from the maintained counters
         # rather than counted: COUNT(*) over 4.6M blocks and 5.3M txs is a full
         # index scan each, 0.28s and 0.63s, on the path every page load takes.
-        # See DB._backfill_stats for why the counters are exact.
+        # See DB.recompute_stats for why the counters are exact.
         nblocks = self.db.n_blocks()
         ntx = self.db.n_txs()
         tip_ntx = self.db.query(
@@ -170,10 +182,18 @@ class Explorer:
         }
 
     def block(self, ref):
+        # `ref` is a URL path segment, so it arrives as a str that is usually a
+        # hash and sometimes a height. One statement cannot ask for both here:
+        # blocks.height is an integer column, and Postgres rejects
+        # height='<64 hex chars>' outright, where sqlite3's dynamic typing
+        # silently compared them and matched nothing. So the reference is
+        # classified first, and the two lookups ask disjoint questions -- a
+        # 64-character hex hash cannot also be a height.
+        col, val = ("height", int(ref)) if _is_height(ref) else ("hash", ref)
         rows = self.db.query(
             "SELECT height, hash, version, merkleroot, time, nonce, bits, "
             "difficulty, size, prev_hash, next_hash FROM blocks "
-            "WHERE hash=? OR height=?", (ref, ref))
+            "WHERE " + col + "=?", (val,))
         if not rows:
             return None
         block = dict(zip(BLOCK_COLS, rows[0]))
@@ -454,7 +474,7 @@ class Handler(BaseHTTPRequestHandler):
             # simultaneous long queries. Say so instead of waiting forever.
             self._send(503, {"error": "busy"})
             return
-        except sqlite3.Error as e:
+        except psycopg.Error as e:
             self._send(500, {"error": str(e)})
             return
         self._send(*res)
@@ -462,18 +482,30 @@ class Handler(BaseHTTPRequestHandler):
 
 def main():
     p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument("db", nargs="?", default="explorer.db")
+    p.add_argument("dsn", nargs="?", default=DEFAULT_DSN)
     p.add_argument("--host", default="::")
     p.add_argument("--port", type=int, default=8080)
     args = p.parse_args()
 
-    DB.initialize(args.db)   # create/migrate the schema exactly once
-    Handler.pool = DBPool(args.db)   # and warm the read connections
     server_cls = DualStackHTTPServer
     if ":" not in args.host:  # literal IPv4 address -> plain IPv4 bind
         server_cls = ThreadingHTTPServer
+    # Bind BEFORE the schema work, and treat that work as optional. The schema
+    # belongs to the indexer: on a database being built from scratch it is
+    # creating tables and locking them for as long as that takes, and this
+    # process used to stand still waiting for that lock before opening a
+    # socket -- so a cold start answered the browser with connection-refused
+    # until someone ran it a second time. Reading needs no lock and no DDL
+    # (DB.connect opens schema=False), so there is nothing here that has to
+    # finish before the port answers.
     httpd = server_cls((args.host, args.port), Handler)
     print("explorer running on http://%s:%d/" % (args.host, args.port))
+
+    try:
+        DB.initialize(args.dsn)   # create the schema if nobody else has
+    except Exception as e:       # already; a failure here must not stop the
+        print("warning: schema init failed (%s); serving anyway" % e)
+    Handler.pool = DBPool(args.dsn)   # and warm the read connections
 
     def _stop(signum, frame):
         raise KeyboardInterrupt

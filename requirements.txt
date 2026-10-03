@@ -1,0 +1,3 @@
+# The explorer used to be standard library only; PostgreSQL storage needs one
+# package. psycopg3 (not psycopg2).
+psycopg>=3.1

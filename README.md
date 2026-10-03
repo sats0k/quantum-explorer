@@ -1,7 +1,8 @@
 # PhoenixCoin Quantum Block Explorer
 
 A minimal block explorer for the PhoenixCoin Quantum network, written in
-pure Python (stdlib only) with SQLite storage.
+pure Python with PostgreSQL storage. The only dependency is `psycopg` (psycopg3);
+everything else is the standard library.
 
 Hybrid transactions are supported **for free**: the indexer stores the
 daemon's own verbose `getrawtransaction` output, which already decodes the
@@ -13,22 +14,38 @@ script parsing is reimplemented on the explorer side.
 
 | File              | Purpose                                        |
 | ----------------- | ---------------------------------------------- |
-| `indexer.py`      | Syncs chain + mempool from the daemon into SQLite |
-| `db.py`           | SQLite schema (`blocks`, `txs`, `vin`, `vout`, `addr_out`, `scripts`, `meta`) |
+| `indexer.py`      | Syncs chain + mempool from the daemon into PostgreSQL |
+| `db.py`           | Schema and queries (`blocks`, `txs`, `vin`, `vout`, `addr_out`, `scripts`, `meta`) |
 | `rpc.py`          | JSON-RPC client (basic auth)                   |
 | `server.py`       | Read-only JSON API + static web UI             |
 | `explorer.sh`     | Start/stop/status wrapper for indexer + web UI |
 | `web/index.html`  | Single-page explorer frontend                  |
 | `test_db.py`      | Regression tests for indexing + accounting     |
 
+## Setup
+
+```
+pip install psycopg          # psycopg3; the only dependency
+createdb explorer            # the indexer's database
+```
+
+The explorer needs a role that can create tables and indexes in that database
+and nothing more:
+
+```sql
+CREATE ROLE explorer LOGIN PASSWORD '...';
+CREATE DATABASE explorer OWNER explorer;
+```
+
 ## Tests
 
 ```
-python3 -m unittest test_db -v
+EXPLORER_TEST_DSN='dbname=explorer_test' python3 -m unittest test_db -v
 ```
 
-No dependencies beyond the standard library, and no daemon needed: the tests
-build a temp database and drive `DB` directly.
+A PostgreSQL server is required but no daemon is. Each test builds its own
+schema inside the test database, so the suite can run against a live server and
+one test's leftovers cannot collide with the next one's.
 
 ## Usage
 
@@ -49,11 +66,12 @@ Any bare argument (or no argument) means `start`. The web UI lands on
 
 | Variable    | Default     | Meaning                    |
 | ----------- | ----------- | -------------------------- |
-| `DB`        | `explorer.db` | SQLite file               |
+| `DB`        | `dbname=explorer` | libpq DSN or URI       |
 | `RPCUSER`   | `user`    | daemon RPC user            |
 | `RPCPASSWORD` | `pass`      | daemon RPC password        |
 | `RPCHOST`   | `127.0.0.1` | daemon RPC host            |
 | `RPCPORT`   | `9554`      | daemon RPC port            |
+| `EXPLORER_DSN` | `dbname=explorer` | DSN used when none is passed on the command line |
 | `WEBHOST`   | `::`        | web bind address           |
 | `WEBPORT`   | `8080`      | web port                   |
 
@@ -67,9 +85,11 @@ Running the two by hand instead:
 
 Point the indexer at the daemon (RPC port `9554` by default):
 
+The first argument is the DSN, not a filename:
+
 ```bash
 cd explorer
-python3 -u indexer.py explorer.db --rpcuser <user> --rpcpassword <pass> --host 127.0.0.1 --port 9554
+python3 -u indexer.py 'dbname=explorer' --rpcuser <user> --rpcpassword <pass> --host 127.0.0.1 --port 9554
 ```
 
 Add `--once` to do a single catch-up pass and exit; otherwise it keeps
@@ -79,7 +99,7 @@ syncing new blocks and the mempool until interrupted. Reorgs are handled
 ### 2. Serve the web UI
 
 ```bash
-python3 server.py explorer.db --port 8080
+python3 server.py 'dbname=explorer' --port 8080
 # open http://127.0.0.1:8080/  (or http://[::1]:8080/ over IPv6)
 ```
 
@@ -142,7 +162,7 @@ So a client that walks a multisig participant address gets a 404 from
 - The explorer is read-only; it never submits anything to the daemon.
 - The web server opens its schema **once** at startup (`DB.initialize`) and then
   serves requests from a small fixed pool of connections (`DB.connect`), which
-  skips the schema/migration path entirely. Opening a fresh connection per
+  skips the schema path entirely. Opening a fresh connection per
   request made `CREATE TABLE IF NOT EXISTS` for every table run on every
   `/api/...` call -- about 0.5 ms and 89% of the per-request overhead, against
   ~0.06 ms for the connect itself.
@@ -154,13 +174,41 @@ So a client that walks a multisig participant address gets a 404 from
   the window is answered `503 {"error": "busy"}` instead of parking the thread.
 - Run with `-rpcuser`/`-rpcpassword` in `phoenixcoin.conf` (or the process
   flags); the RPC server must be reachable on `127.0.0.1`.
-- `db.py` sets WAL mode; the indexer and web server may run concurrently
-  against the same file.
-- `busy_timeout` is 5 s for ordinary work and 30 min only while a migration is
+- The indexer and web server are separate processes against one PostgreSQL
+  database. They are never in the same transaction, so concurrent access needs
+  no coordination beyond PostgreSQL's own.
+- **There are no migrations.** The schema is never altered in place. Changing
+  it means a shape change is detected on the next indexer start, the tables are
+  dropped, and the chain is re-synced from genesis (a few minutes; this chain is
+  ~409k blocks). What that buys is the deletion of every in-place migration path
+  and with it the failure mode where one adds a column with a default and
+  leaves it unbackfilled -- which reads as a correct database and answers every
+  balance with the entire supply.
+- The trigger is `SCHEMA_FINGERPRINT`, a hash of the `SCHEMA` tuple in `db.py`,
+  so editing that DDL is all it takes; there is no version number to remember to
+  bump. The fingerprint is written into `meta` by whichever process can vouch for
+  the shape: the indexer (`DB.initialize(dsn, rebuild=True)`) always, and the web
+  server only when it built the schema itself. The web side therefore cannot
+  discard a chain, and cannot stamp a database it has not checked either -- if
+  it could, the indexer arriving a second later would read a matching
+  fingerprint, skip the rebuild, and serve the old chain against new code.
+- Only tables named in `SCHEMA` are dropped. Anything else in the schema is left
+  alone, so a rebuild cannot destroy a table that merely shares the database.
+- `lock_timeout` is 5 s for ordinary work and 30 min only while schema work is
   running, then the connection drops back to 5 s. A web request must not park
-  for half an hour because the indexer is rewriting the schema. In WAL mode
-  reads never block on the indexer's writes anyway; it is a write that waits,
+  for half an hour because the indexer is rebuilding. It is a write that waits,
   and it should fail fast and retry on the next cycle.
+- Schema work takes `pg_advisory_xact_lock` keyed on the current schema, so two
+  processes starting at once cannot build over each other, and two schemas (as
+  the tests use) do not block one another. This lock covers the whole build, not
+  just parts of it: `CREATE TABLE IF NOT EXISTS` is not race-safe in
+  PostgreSQL, so two sessions creating the same table at once can still collide
+  in `pg_type`. That was a real cold-start failure here -- the web server lost
+  and died before binding, so the browser got connection-refused until the
+  second run.
+- Identifier columns are declared `COLLATE "C"` so ordering is bytewise, which
+  is what the SQLite `BINARY` collation did. The database's own locale does not
+  change how hashes or addresses sort.
 - The Phoenixcoin Quantum daemon has no `-txindex`, so
   `getrawtransaction` can only resolve confirmed txs that still have
   unspent outputs. A tx whose outputs are all spent (the genesis coinbase
