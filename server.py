@@ -35,6 +35,7 @@ import queue
 import signal
 import socket
 import sys
+import traceback
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse
 
@@ -520,8 +521,23 @@ class Handler(BaseHTTPRequestHandler):
             # simultaneous long queries. Say so instead of waiting forever.
             self._send(503, {"error": "busy"})
             return
-        except psycopg.Error as e:
-            self._send(500, {"error": str(e)})
+        except psycopg.Error:
+            # A psycopg exception message is written for whoever has to fix the
+            # query, not for whoever made the request: it names the table and
+            # column, quotes the failing statement, names the constraint, and
+            # carries a HINT that can hand over the schema around it -- enough to
+            # reconstruct the database's shape, and to tell a probe which column
+            # it should be asking about instead. Returning str(e) published all
+            # of that to any client that could reach the port.
+            #
+            # So the detail goes to the log, where the operator reading
+            # server_web.log gets the traceback, and the client gets a fixed
+            # string it learns nothing from. The path is logged with it because
+            # a bare psycopg traceback does not say which request caused it.
+            traceback.print_exc()
+            print("%s %s -> 500 (database error)"
+                  % (self.client_address[0], path), flush=True)
+            self._send(500, {"error": "internal server error"})
             return
         self._send(*res)
 

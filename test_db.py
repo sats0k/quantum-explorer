@@ -1571,6 +1571,60 @@ class BindAddressTest(DBTestCase):
                          "address")
 
 
+class ErrorDisclosureTest(DBTestCase):
+    """A database error must not become the response body.
+
+    str(psycopg.Error) is written for whoever has to fix the query. It names the
+    table and column, quotes the failing statement, names the constraint, and
+    carries a HINT that hands over the schema around it -- so returning it
+    published the database's shape to anyone who could reach the port. The
+    detail belongs in the log, where the operator gets it.
+    """
+
+    def _serve(self, pool):
+        import http.server
+        server_module.Handler.pool = pool
+        httpd = http.server.ThreadingHTTPServer(("127.0.0.1", 0),
+                                                server_module.Handler)
+        port = httpd.server_address[1]
+        threading.Thread(target=httpd.serve_forever, daemon=True).start()
+        self.addCleanup(httpd.server_close)
+        self.addCleanup(httpd.shutdown)
+        return port
+
+    def test_a_database_error_answers_a_fixed_string_and_logs_the_detail(self):
+        import urllib.request
+        pool = DBPool(self.db_path, size=1)
+        self.addCleanup(pool.close)
+        port = self._serve(pool)
+
+        self.db.add_block(Block({"height": 1, "hash": "b1", "time": 1, "tx": []}))
+        # Rename a column the summary endpoint selects, so its query fails the
+        # way a genuine schema/query mismatch would.
+        self.db.conn.execute("ALTER TABLE blocks RENAME COLUMN size TO vsize")
+
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            with self.assertRaises(urllib.error.HTTPError) as cm:
+                urllib.request.urlopen(
+                    "http://127.0.0.1:%d/api/summary" % port, timeout=5)
+            self.assertEqual(cm.exception.code, 500)
+            body = cm.exception.read().decode()
+
+        # What the client is told: one fixed string, and nothing else.
+        self.assertEqual(json.loads(body), {"error": "internal server error"})
+
+        # None of the detail psycopg offered may appear in what was sent.
+        for leak in ("vsize", "blocks", "size", "HINT", "SELECT", "does not exist",
+                     "psycopg", "pg_"):
+            self.assertNotIn(leak, body, "leaked %r in the 500 body" % leak)
+
+        # ...and all of it is still available to whoever runs the server.
+        logged = out.getvalue() + err.getvalue()
+        self.assertIn("UndefinedColumn", logged)
+        self.assertIn("/api/summary", logged)
+
+
 class LockTimeoutTest(DBTestCase):
     """Long only while the schema is being built, short afterwards."""
 
