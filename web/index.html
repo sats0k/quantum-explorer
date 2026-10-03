@@ -57,14 +57,52 @@ const main = document.getElementById("main");
 const tip = document.getElementById("tip");
 const q = document.getElementById("q");
 
-function render(o) {
+// One read of the page is one nav token, and only the newest may paint. Every
+// navigation takes a new token; a response that arrives after the user has
+// moved on checks it and drops itself instead of painting over whatever page
+// they are now on. Without it a slow /api/summary would land after a tx
+// lookup and replace the tx page with the homepage, and a second summary()
+// would bolt a second "Latest Blocks" card onto the first.
+let navToken = 0;
+function nav() { return ++navToken; }
+function stale(token) { return token !== navToken; }
+
+// Every API read goes through here rather than a bare fetch(). A non-2xx
+// answer is an error, not data: the server answers 503 {"error":"busy"} when
+// the connection pool stays exhausted and 500 on a database error, and
+// neither payload has any of the fields the renderers below read -- handing
+// one to a renderer is how a busy pool came out as "Nothing found.", or as an
+// uncaught "txs.map is not a function" that left the page on "looking up…".
+async function api(path) {
+  const r = await fetch(path);
+  let body = null;
+  try { body = await r.json(); } catch { }
+  if (!r.ok) {
+    const e = new Error((body && body.error) || (r.status + " " + r.statusText));
+    e.status = r.status;
+    throw e;
+  }
+  return body;
+}
+
+function failed(e) {
+  // The server answers a database error with a fixed string on purpose -- the
+  // detail names tables and columns, which is not the caller's to read -- so
+  // point at the log, which is where it went.
+  main.innerHTML = `<div class="card"><b>Request failed.</b>
+    <p>${esc(String((e && e.message) || e))}</p>
+    <p style="color:#888;font-size:12px">The server log has the detail.</p></div>`;
+}
+
+function render(o, token) {
+  if (token !== undefined && stale(token)) return;
   // Dispatch on the payload's shape, not on o.tip being non-null: a fresh
   // database returns {"tip": null}, which is a valid summary of an empty chain
   // and must not fall through to "Nothing found.".
   if (o && "tip" in o) {
     if (o.tip) tip.textContent = "height " + o.tip.height;
     else tip.textContent = "no blocks indexed";
-    return summary(o);
+    return summary(o, token);
   }
   if (o && o.script_hash) return script(o);
   if (o && o.address && o.confirmed) return address(o);
@@ -73,7 +111,7 @@ function render(o) {
   main.innerHTML = '<div class="card"><b>Nothing found.</b></div>';
 }
 
-function summary(o) {
+function summary(o, token) {
   // tip === null means the database is empty: no blocks indexed yet. Counts
   // are absent from the payload in that case too, so don't render the table.
   if (!o.tip) {
@@ -91,8 +129,9 @@ function summary(o) {
     <div class="mono">${esc(o.tip.hash)}</div>
     <p>${o.tip.time ? new Date(o.tip.time*1000).toISOString() : ""}</p>
     <table>
-      <tr><th>block</th><th>txs</th><th>mempool</th><th>difficulty</th><th>total coinbase</th></tr>
+      <tr><th>block</th><th>txs in block</th><th>txs in chain</th><th>mempool</th><th>difficulty</th><th>total coinbase</th></tr>
       <tr><td><a href="#" data-b="tip">#${esc(o.tip.height)}</a></td>
+          <td>${esc(o.n_txs_tip)}</td>
           <td>${esc(o.n_txs)}</td>
           <td><a href="#" data-t="mempool">${esc(o.n_mempool)}</a></td>
           <td>${esc(o.tip.difficulty)}</td>
@@ -105,10 +144,20 @@ function summary(o) {
   };
   main.querySelectorAll("a[data-b=tip]").forEach(a =>
     a.onclick = e => { e.preventDefault(); go(String(o.tip.height)); });
-  fetch("/api/recent_blocks").then(r => r.json()).then(renderRecentBlocks);
+  // Appended to the summary page rather than replacing it, so it is the one
+  // render that has to check the token itself: the gap between the innerHTML
+  // above and this response is several queries wide, which is long enough for
+  // the user to have navigated somewhere else.
+  api("/api/recent_blocks").then(blocks => renderRecentBlocks(blocks, token))
+    .catch(e => { if (!stale(token)) failed(e); });
 }
 
-function renderRecentBlocks(blocks) {
+function renderRecentBlocks(blocks, token) {
+  if (token !== undefined && stale(token)) return;
+  if (!Array.isArray(blocks)) {
+    failed(new Error("unexpected /api/recent_blocks payload"));
+    return;
+  }
   const rows = blocks.map(b => `
     <tr><td><a href="#" data-h="${esc(b.height)}">${esc(b.height)}</a></td>
         <td>${esc(b.n_txs)}</td>
@@ -132,9 +181,16 @@ function mempool(txs) {
 }
 
 async function fetchMempool() {
+  const token = nav();
   main.innerHTML = '<div class="card">looking up…</div>';
-  const txs = await fetch("/api/mempool").then(r => r.json());
-  mempool(txs);
+  try {
+    const txs = await api("/api/mempool");
+    if (stale(token)) return;
+    if (!Array.isArray(txs)) throw new Error("unexpected /api/mempool payload");
+    mempool(txs);
+  } catch (e) {
+    if (!stale(token)) failed(e);
+  }
 }
 
 function go(param) {
@@ -149,28 +205,51 @@ function go(param) {
 
 async function fetchHint(param) {
   if (param === "mempool") return fetchMempool();
+  // One token for the whole lookup, checked before every render: this walks up
+  // to five endpoints in sequence, so the page it answers for is often several
+  // navigations old by the time the last one comes back.
+  const token = nav();
   main.innerHTML = '<div class="card">looking up…</div>';
-  if (/^\d+$/.test(param)) {
-    const r = await fetch("/api/block/" + param);
-    if (r.ok) { render(await r.json()); return; }
+  // The 404s are the normal path through a multi-lookup, so they fall through
+  // to the next shape rather than throwing; only a real failure (a busy pool, a
+  // database error, a dead server) breaks the walk, and that is what has to
+  // replace "looking up…" instead of leaving it there for good.
+  const isNum = /^\d+$/.test(param);
+  const attempts = [];
+  if (isNum) attempts.push("/api/block/" + param);
+  if (/^[0-9a-f]{40}$/i.test(param)) attempts.push("/api/script/" + param);
+  if (!isNum) attempts.push("/api/block/" + param);
+  attempts.push("/api/tx/" + param, "/api/address/" + param);
+  let hard = null;
+  for (const path of attempts) {
+    let r;
+    try {
+      r = await api(path);
+    } catch (e) {
+      if (e.status === 404) continue;
+      hard = e;
+      break;
+    }
+    if (stale(token)) return;
+    render(r, token);
+    return;
   }
-  if (/^[0-9a-f]{40}$/i.test(param)) {
-    const rs = await fetch("/api/script/" + param);
-    if (rs.ok) { render(await rs.json()); return; }
-  }
-  const r = await fetch("/api/block/" + param);
-  if (r.ok) { render(await r.json()); return; }
-  const r2 = await fetch("/api/tx/" + param);
-  if (r2.ok) { render(await r2.json()); return; }
-  const r3 = await fetch("/api/address/" + param);
-  if (r3.ok) { render(await r3.json()); return; }
-  main.innerHTML = '<div class="card"><b>Nothing found.</b></div>';
+  if (stale(token)) return;
+  if (hard) failed(hard);
+  else main.innerHTML = '<div class="card"><b>Nothing found.</b></div>';
 }
 
 function fmtSize(s) {
   if (s === null || s === undefined) return "—";
   return s + " B";
 }
+
+// Genesis has no previous block and the tip has no next one, so there is
+  // nothing to look up for either. Emitting the dash as a link anyway made the
+  // `if (pb)` guards below dead code and sent "—" through the whole lookup.
+  function hashOrDash(hash, which) {
+    return hash ? `<a href="#" data-b="${which}">${esc(hash)}</a>` : "—";
+  }
 
 function block(b) {
   const rows = b.txs.map(t => `
@@ -190,8 +269,8 @@ function block(b) {
       <tr><th>nonce</th><td>${esc(b.nonce)}</td></tr>
       <tr><th>bits</th><td>${esc(b.bits)}</td></tr>
       <tr><th>merkleroot</th><td class="mono">${esc(b.merkleroot)}</td></tr>
-      <tr><th>prev</th><td class="mono"><a href="#" data-b="prev">${esc(b.prev_hash || "—")}</a></td></tr>
-      <tr><th>next</th><td class="mono"><a href="#" data-b="next">${esc(b.next_hash || "—")}</a></td></tr>
+      <tr><th>prev</th><td class="mono">${hashOrDash(b.prev_hash, "prev")}</td></tr>
+      <tr><th>next</th><td class="mono">${hashOrDash(b.next_hash, "next")}</td></tr>
     </table>
   </div>
   <div class="card"><h2>Transactions</h2>
@@ -223,6 +302,13 @@ function plural(n, word) {
   return `${esc(n)} ${word}${n === 1 ? "" : "s"}`;
 }
 
+// Ellipsis only when the slice actually cut something: the old form appended
+// one unconditionally, so every script hex ended in "…" whether or not it had
+// been truncated, and a script with no hex rendered as a bare "…".
+function clip(s, max) {
+  return s.length > max ? s.slice(0, max) + "…" : s;
+}
+
 function heightLink(h) {
   // Null height: this script has only ever been seen unconfirmed, so there is
   // no block to link to (a sentinel height like 2147483648 would be a lie).
@@ -238,7 +324,7 @@ function tx(t) {
     <tr><td>${esc(v.value_hex)}</td>
         <td><span class="badge ${v.type.includes("hybrid") ? "hybrid" : ""}">${esc(v.type)}</span></td>
         <td>${(v.addresses || []).map(addrLink).join(", ") || "—"}</td>
-        <td class="mono">${v.script_hash ? `<span class="badge">script</span> <a href="#" data-sh="${esc(v.script_hash)}" class="scripthash">${esc(v.script_hash.slice(0, 16))}…</a><br>` : ""}${esc((v.script_hex || "").slice(0, 120))}…</td>
+        <td class="mono">${v.script_hash ? `<span class="badge">script</span> <a href="#" data-sh="${esc(v.script_hash)}" class="scripthash">${esc(v.script_hash.slice(0, 16))}…</a><br>` : ""}${esc(clip((v.script_hex || "").slice(0, 120), 120))}</td>
     </tr>`).join("");
   const kind = t.is_coinbase ? '<span class="badge">coinbase</span>'
              : (t.status === "mempool" ? '<span class="badge">mempool</span>'
@@ -291,6 +377,12 @@ function address(a) {
   const notice = a.outputs_truncated
     ? `<p class="card" style="padding:10px 16px;color:#c60;font-size:12px">Showing the first
        ${esc(a.outputs.length)} of ${esc(a.n_outputs)} outputs (balances are still accurate).</p>` : "";
+  // n_txs is the address's real count; a.txs is the same list capped at the
+  // server's 2000-row limit, so a.txs.length reports 2000 for an address with
+  // any history past that. Show the count, and say so when it is a slice.
+  const txNotice = a.txs_truncated
+    ? `<p style="color:#c60;font-size:12px;margin:4px 16px 0">Showing the first
+       ${esc(a.txs.length)} of ${esc(a.n_txs)} transactions.</p>` : "";
   main.innerHTML = `
   <div class="card">
     <h2>Address</h2>
@@ -303,7 +395,7 @@ function address(a) {
           <td><b>${esc(a.live.balance_hex)}</b> PXC</td></tr>
       <tr><th>received</th><td>${esc(a.live.value_received_hex)} PXC (${plural(a.live.n_outputs, "output")})</td></tr>
       <tr><th>spent</th><td>${esc(a.live.value_spent_hex)} PXC</td></tr>
-      <tr><th>txs</th><td>${esc(a.txs.length)}</td></tr>
+      <tr><th>txs</th><td>${esc(a.n_txs)}</td></tr>
     </table>
   </div>
   ${notice}
@@ -313,6 +405,7 @@ function address(a) {
   </div>
   <div class="card"><h2>Transactions</h2>
     <table>${trows}</table>
+    ${txNotice}
   </div>`;
   main.querySelectorAll("a[data-tx]").forEach(a =>
     a.onclick = e => { e.preventDefault(); go(a.dataset.tx); });
@@ -363,7 +456,14 @@ document.querySelector("a[data-home]").onclick = e => {
 function route() {
   const h = location.hash.slice(1);
   if (!h) {
-    fetch("/api/summary").then(r => r.json()).then(render);
+    const token = nav();
+    main.innerHTML = '<div class="card">loading…</div>';
+    // Errors included: a bare fetch().then(r => r.json()) fed the 503
+    // {"error":"busy"} payload to render(), which matched none of its shapes
+    // and reported "Nothing found." on a healthy, fully indexed chain.
+    api("/api/summary")
+      .then(o => render(o, token))
+      .catch(e => { if (!stale(token)) failed(e); });
   } else {
     try { go(decodeURIComponent(h)); }
     catch { go(h); }
