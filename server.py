@@ -115,6 +115,29 @@ def reachable_off_machine(host):
 # worse than a bounded one.
 POOL_TIMEOUT = 5.0
 
+# An address's tx history is two halves of one set: the txs that paid it, and
+# the txs that spent what it was paid. Written once here because the list and
+# the count below have to agree on it exactly -- they are the same question
+# asked twice, once bounded and once not.
+#
+# Orphaned txs are excluded: the txs list is current history, and no other
+# endpoint counts an orphan anywhere. Reorgs sever an orphan's vin rows
+# (db._clear_from), so the join could not see one on a real database -- but the
+# filter states the contract rather than leaning on that data-layer detail
+# alone, and an orphan test that leaves the rows in place is exactly the case
+# where leaning on it would be wrong.
+#
+# The txs join is the expensive half and stays. Dropping it was measured as
+# worth ~4s on the 510k-output address, which is not a good trade for weakening
+# the guarantee.
+ADDR_TXS_UNION = (
+    "SELECT txid FROM addr_out WHERE address=?"
+    " UNION"
+    " SELECT i.txid FROM vin i"
+    " JOIN txs t ON t.txid = i.txid"
+    " JOIN addr_out a ON a.txid = i.prev_txid AND a.n = i.prev_vout"
+    " WHERE a.address=? AND t.status != 'orphaned'")
+
 
 class DBPool:
     """A fixed set of read connections, handed out to request threads.
@@ -303,38 +326,34 @@ class Explorer:
             "SELECT txid, n, value, type, spent_by FROM addr_out "
             "WHERE address=? ORDER BY txid, n LIMIT ?",
             (addr, self.ADDR_OUT_LIMIT))
-        # Every transaction spending one of this address's outputs, in a single
-        # enumeration, for the spending half of the txs list below. The per-output
-        # spent_confirmed flag no longer comes from here: it is spent_by's
-        # confirmed bit, read off the row we already fetched, so the two views of
-        # an output's status are no longer derived by walking the address twice
-        # for two purposes.
+        # Transactions touching the address from either side: the ones that paid
+        # it and the ones that spent what it was paid, which is what
+        # ADDR_TXS_UNION holds. The list used to be built from addr_out alone, so
+        # an address whose every received coin was later spent ended its tx
+        # history at the last payout -- the transactions that moved those coins
+        # back out were invisible, and n_txs understated the participation.
         #
-        # Orphaned txs are excluded: the txs list is current history, and no
-        # other endpoint counts an orphan anywhere. Reorgs sever an orphan's vin
-        # rows (db._clear_from), so the join could not see one on a real
-        # database -- but the filter states the contract rather than leaning on
-        # that data-layer detail alone, and an orphan test that leaves the rows
-        # in place is exactly the case where leaning on it would be wrong.
-        # Dropping this join was measured as worth ~4s on the 510k-output
-        # address and is not worth weakening the guarantee for.
-        spend_txids = set(r[0] for r in self.db.query(
-            "SELECT i.txid FROM vin i"
-            " JOIN txs t ON t.txid = i.txid"
-            " JOIN addr_out a ON a.txid = i.prev_txid AND a.n = i.prev_vout"
-            " WHERE a.address=? AND t.status != 'orphaned'", (addr,)))
-        # Transactions touching the address from either side: the receiving ones
-        # straight from addr_out (the primary key streams them in txid order),
-        # unioned with the spenders above, deduped and sorted in Python. The
-        # list used to be built from addr_out alone, so an address whose every
-        # received coin was later spent ended its tx history at the last payout
-        # -- the transactions that moved those coins back out were invisible,
-        # and n_txs understated the participation.
-        involved = sorted(set(r[0] for r in self.db.query(
-            "SELECT DISTINCT txid FROM addr_out WHERE address=?", (addr,)))
-            | spend_txids)
-        n_txs = len(involved)
-        txs = involved[:self.ADDR_OUT_LIMIT]
+        # Both halves used to be assembled here in Python, which made this the
+        # one endpoint whose cost the caller chose: the spender enumeration had
+        # no row cap, n_txs was len() of the union, and the union was then
+        # sorted. So a high-activity address put its entire tx history into the
+        # request thread's heap -- one statement's worth of rows, plus a sort
+        # over them -- before being sliced back down to ADDR_OUT_LIMIT entries
+        # for the response. The outputs half above was capped; this one was not,
+        # and the 510k-output address in the tests is the case that proves it.
+        #
+        # Now the cap is a LIMIT in the statement, so the database stops when it
+        # has enough and this process never sees the rest. n_txs stays exact --
+        # txs_truncated is judged against it, and reporting a bounded number as
+        # the real one would be a different lie -- but it is counted where the
+        # rows already are, so the set behind it is the database's memory
+        # concern rather than ours.
+        txs = [r[0] for r in self.db.query(
+            ADDR_TXS_UNION + " ORDER BY txid LIMIT ?",
+            (addr, addr, self.ADDR_OUT_LIMIT))]
+        n_txs = self.db.query(
+            "SELECT COUNT(*) FROM (%s) u" % ADDR_TXS_UNION,
+            (addr, addr))[0][0]
         return {
             "address": addr,
             "confirmed": with_hex(bal["confirmed"]),

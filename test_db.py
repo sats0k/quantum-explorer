@@ -1919,6 +1919,155 @@ class OrphanTxHistoryTest(DBTestCase):
         self.assertEqual(a["n_txs"], 1)
 
 
+class BoundedTxHistoryTest(DBTestCase):
+    """A whale's tx history must be capped in the statement, not after it.
+
+    /api/address already capped its outputs at ADDR_OUT_LIMIT, but the tx list
+    did not: the spender enumeration had no row cap, n_txs was len() of the
+    union of both halves, and the union was sorted in Python. So a single
+    request for a high-activity address pulled that address's entire tx history
+    into the request thread's heap and sorted it there, then returned the first
+    ADDR_OUT_LIMIT entries. The caller chose the address, so the caller chose
+    the allocation -- and ThreadingHTTPServer runs those requests concurrently.
+
+    Both halves are now one set expression with a LIMIT, and the count is
+    counted where the rows are, so n_txs is still exact (txs_truncated is
+    judged against it) without the rows behind it ever arriving.
+    """
+
+    CAP = 20        # the cap these tests turn down, so 30 txs can cross it
+
+    def whale(self, n_tx):
+        """One address with `n_tx` txs behind it.
+
+        Three kinds of participation, because a union is only interesting where
+        the halves overlap and where one half is empty: every tx pays the
+        whale, every third also spends the whale's own previous coin (both
+        halves), and every tx numbered 1 mod 3 spends without paying (the
+        spending half alone).
+        """
+        for i in range(n_tx):
+            pays = [("whale", POKE, 1)]
+            spends = []
+            if i and i % 3 == 0:
+                pays.append(("whale", POKE, 2))
+                spends = [prev]
+            elif i and i % 3 == 1:
+                spends = [prev]
+            self.db.add_tx(tx("%08x" % (0xABC0000 + i), 100 + i, pays,
+                              spends=spends))
+            prev = ("%08x" % (0xABC0000 + i), 0)
+        self.db.conn.commit()
+
+    def capped(self):
+        """An Explorer whose cap is CAP, to cross it without 2000 txs.
+
+        The statement is identical -- the bound is a parameter, not a literal --
+        so this exercises the same path the 2000 default does.
+        """
+        cls = type("CappedExplorer", (Explorer,), {"ADDR_OUT_LIMIT": self.CAP})
+        return cls(self.db)
+
+    def full_history(self, addr):
+        """The pre-fix path, verbatim: every distinct txid, in Python."""
+        spend = set(r[0] for r in self.db.query(
+            "SELECT i.txid FROM vin i"
+            " JOIN txs t ON t.txid = i.txid"
+            " JOIN addr_out a ON a.txid = i.prev_txid AND a.n = i.prev_vout"
+            " WHERE a.address=? AND t.status != 'orphaned'", (addr,)))
+        involved = sorted(set(r[0] for r in self.db.query(
+            "SELECT DISTINCT txid FROM addr_out WHERE address=?", (addr,))) | spend)
+        return involved
+
+    def test_the_list_is_the_same_window_the_full_history_would_have_given(self):
+        self.whale(30)
+        everything = self.full_history("whale")
+
+        a = self.capped().address("whale")
+
+        # The bounded query must reproduce the prefix the unbounded one sliced.
+        self.assertEqual(a["txs"], everything[:self.CAP])
+        self.assertEqual(a["txs"], sorted(a["txs"]))
+        self.assertEqual(len(set(a["txs"])), len(a["txs"]),
+                         "a tx on both sides is listed once")
+
+    def test_n_txs_counts_the_whole_history_while_the_list_stays_capped(self):
+        self.whale(30)
+        everything = self.full_history("whale")
+
+        a = self.capped().address("whale")
+
+        self.assertEqual(len(everything), 30)
+        self.assertEqual(a["n_txs"], 30, "the count is the true one, not the cap")
+        self.assertEqual(len(a["txs"]), self.CAP)
+        self.assertNotEqual(a["n_txs"], len(a["txs"]))
+        self.assertTrue(a["txs_truncated"])
+
+    def test_an_address_under_the_cap_is_not_truncated(self):
+        self.whale(self.CAP - 2)
+        a = self.capped().address("whale")
+        self.assertEqual(a["n_txs"], self.CAP - 2)
+        self.assertEqual(len(a["txs"]), self.CAP - 2)
+        self.assertFalse(a["txs_truncated"])
+
+    def test_the_window_spans_both_halves_rather_than_filling_from_one(self):
+        # The cap must not be spent on one half while the other goes missing.
+        # One receive, then more spends than the window holds: the list has to
+        # be the receive plus the spends that sort before the cut, and n_txs
+        # has to reach past it.
+        self.db.add_tx(tx("PAY", 100,
+                          [("whale", POKE, i) for i in range(self.CAP + 6)],
+                          coinbase=True))
+        for i in range(self.CAP + 5):
+            self.db.add_tx(tx("s%03d" % i, 101 + i, [], spends=[("PAY", i)]))
+        self.db.conn.commit()
+
+        a = self.capped().address("whale")
+
+        self.assertEqual(len(a["txs"]), self.CAP)
+        self.assertIn("PAY", a["txs"], "the receiving half is in the window")
+        self.assertIn("s000", a["txs"], "and so is the spending half")
+        self.assertEqual(a["txs"], self.full_history("whale")[:self.CAP])
+        self.assertEqual(a["n_txs"], self.CAP + 6,
+                         "the spends past the window are still counted")
+
+    def test_the_statement_itself_carries_the_cap(self):
+        # The regression is about what crosses into the process, so assert on
+        # the query, not only on the answer: an edit that builds the list in
+        # Python again would still pass the tests above.
+        self.whale(3)
+        issued = []
+        real = self.db.query
+        self.db.query = lambda sql, *a: (issued.append((sql, a[0])) or real(sql, *a))
+        self.addCleanup(setattr, self.db, "query", real)
+        self.explorer.address("whale")
+
+        listed = [(sql, params) for sql, params in issued
+                  if "ORDER BY txid LIMIT" in sql]
+        self.assertEqual(len(listed), 1,
+                         "the tx list must come from one bounded statement")
+        sql, params = listed[0]
+        self.assertIn("UNION", sql, "both halves of the history, still")
+        self.assertEqual(params[-1], 2000, "the advertised cap")
+        self.assertEqual(Explorer.ADDR_OUT_LIMIT, 2000)
+
+        counted = [sql for sql, _ in issued if "COUNT(*)" in sql]
+        self.assertTrue(any("UNION" in s for s in counted),
+                        "n_txs is counted over the same set the list came from")
+
+    def test_the_order_is_bytewise_not_locale_ordered(self):
+        # ORDER BY now happens in the database. txid is COLLATE "C" so it stays
+        # bytewise, which is what Python's sorted() did -- a locale-aware
+        # collation would sort 'a' before 'Z' and silently reorder history.
+        self.db.add_tx(tx("Zebra", 100, [("whale", POKE, 1)], coinbase=True))
+        self.db.add_tx(tx("apple", 101, [("whale", POKE, 1)]))
+        self.db.add_tx(tx("Apple", 102, [("whale", POKE, 1)]))
+        self.db.conn.commit()
+        a = self.explorer.address("whale")
+        self.assertEqual(a["txs"], ["Apple", "Zebra", "apple"])
+        self.assertEqual(a["txs"], self.full_history("whale"))
+
+
 class AddOrderSpentFlagTest(DBTestCase):
     """spent_by must follow the vin table, not the order txs were added in.
 

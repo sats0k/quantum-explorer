@@ -170,6 +170,16 @@ So a client that walks a multisig participant address gets a 404 from
 `req_sigs` and `type` fields there say how much of the script is required, which
 `/api/address` cannot express.
 
+`/api/address` lists at most 2,000 outputs and 2,000 transactions, because the
+caller picks the address and a high-activity one would otherwise make the
+response cost whatever its owner made it cost. `n_outputs` and `n_txs` are the
+true totals, not the lengths of the lists next to them, so `outputs_truncated`
+and `txs_truncated` say which of the two you are looking at. The transactions
+are the first 2,000 in bytewise txid order, counting both directions: the ones
+that paid the address and the ones that spent what it was paid. There is no
+page parameter, so a client that needs more than the window has to narrow the
+address rather than ask twice.
+
 ## Notes
 
 - The explorer is read-only; it never submits anything to the daemon.
