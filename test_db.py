@@ -13,6 +13,7 @@ every permutation rather than one hand-picked sequence.
 """
 
 import contextlib
+import io
 import itertools
 import json
 import os
@@ -96,6 +97,17 @@ def indexes_on(db, table):
     return sorted(r[0] for r in db.query(
         "SELECT indexname FROM pg_indexes "
         "WHERE schemaname = current_schema() AND tablename = ?", (table,)))
+
+
+def _without_comments(ddl):
+    """DDL text with its `--` comments removed.
+
+    Only for asserting that two schemas differ *only* in comment text -- which
+    is exactly the distinction the fingerprint cannot make and the rebuild
+    announcement exists to surface. Not a general SQL parser: `--` inside a
+    string literal would be mishandled, and SCHEMA has no such literal.
+    """
+    return "\n".join(re.sub(r"--[^\n]*", "", line) for line in ddl.splitlines())
 
 
 def tables_in(db):
@@ -1172,6 +1184,128 @@ class RebuildTest(DBTestCase):
         # depending on the warning the fix exists to prevent.
         with self.assertRaises(psycopg.OperationalError):
             opened[0].execute("SELECT 1")
+
+
+class RebuildAnnouncementTest(DBTestCase):
+    """A rebuild has to say so, and has to say what caused it.
+
+    The fingerprint is taken over the whole statement, comment text included, so
+    a reworded `--` comment discards the chain exactly as a dropped column
+    does. That is left as it is -- hashing less of the DDL would trade a
+    recoverable few minutes for the possibility of two different schemas
+    sharing a fingerprint -- but it leaves two very different mistakes looking
+    identical from the outside. Both used to be entirely silent, so the only
+    symptom of either was a site that had emptied itself and was slowly
+    refilling, minutes later.
+    """
+
+    def _index_three(self):
+        """A chain worth throwing away, so an emptied one is visible."""
+        for i, (addr, val) in enumerate((("addr0", 1), ("addr1", 2),
+                                         ("addr2", 3))):
+            self.db.add_block(Block({"height": 100 + i, "hash": "b%d" % i,
+                                     "time": 1, "tx": []}))
+            self.db.add_tx(tx(chr(ord("A") + i), 100 + i, [(addr, POKE, val)],
+                              coinbase=True))
+        self.db.conn.commit()
+
+    def announce(self, stored_ddl, fingerprint="0000000000000000"):
+        """Index a chain, record `stored_ddl` as this database's schema text
+        (or no text at all, for None, as a database predating that key), then
+        open with a rebuild and return what that printed."""
+        self._index_three()
+        if stored_ddl is None:
+            self.db.conn.execute("DELETE FROM meta WHERE key=?",
+                                 (db_module.SCHEMA_DDL_KEY,))
+            self.db.conn.commit()
+        else:
+            self.db.set_meta(db_module.SCHEMA_DDL_KEY, stored_ddl)
+            self.db.conn.commit()
+        # Last, because it closes this connection on its way out.
+        self.db.conn.execute(
+            "INSERT INTO meta(key, value) VALUES(?,?)"
+            " ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            (db_module.FINGERPRINT_KEY, fingerprint))
+        self.db.conn.commit()
+        self.db.conn.close()
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.reopened(rebuild=True)
+        return out.getvalue()
+
+    def test_a_rebuild_names_both_fingerprints(self):
+        said = self.announce(db_module.SCHEMA_TEXT)
+        self.assertIn("0000000000000000", said)
+        self.assertIn(db_module.SCHEMA_FINGERPRINT, said)
+        self.assertIn("discarding the indexed chain", said)
+
+    def test_a_comment_only_change_is_shown_as_a_comment(self):
+        # The case the announcement exists for: this is a typo, not a schema
+        # change, and it costs the same rebuild either way.
+        # A phrase that occurs only inside a `--` comment -- "mempool" would
+        # not do, being a column name too, which would make this a real DDL
+        # change and quietly test the wrong thing.
+        stored = db_module.SCHEMA_TEXT.replace("while unconfirmed",
+                                               "while not yet confirmed")
+        self.assertNotEqual(stored, db_module.SCHEMA_TEXT,
+                            "the fixture has to differ from the real schema")
+        # Establish that this really is the mistake it is standing in for:
+        # take the comments out and the two schemas are the same schema.
+        self.assertEqual(_without_comments(stored),
+                         _without_comments(db_module.SCHEMA_TEXT))
+        said = self.announce(stored)
+        self.assertIn("while not yet confirmed", said,
+                      "the diff shows the reworded comment")
+        self.assertIn("while unconfirmed", said)
+
+    def test_a_real_ddl_change_is_shown_as_ddl(self):
+        stored = db_module.SCHEMA_TEXT.replace(
+            '"difficulty" DOUBLE PRECISION', '"difficulty" REAL')
+        self.assertNotEqual(stored, db_module.SCHEMA_TEXT,
+                            "the fixture has to differ from the real schema")
+        # And that this one is the other kind of mistake: the columns differ,
+        # comments or not.
+        self.assertNotEqual(_without_comments(stored),
+                            _without_comments(db_module.SCHEMA_TEXT))
+        said = self.announce(stored)
+        self.assertIn("difficulty", said)
+        self.assertIn("REAL", said)
+
+    def test_a_matching_fingerprint_says_nothing(self):
+        # Every healthy start. A warning on each one would train the reader to
+        # ignore the one that matters.
+        said = self.announce(db_module.SCHEMA_TEXT,
+                             fingerprint=db_module.SCHEMA_FINGERPRINT)
+        self.assertEqual(said, "")
+        self.assertEqual(
+            self.reopened(rebuild=False).conn.execute(
+                "SELECT COUNT(*) FROM blocks").fetchone()[0], 3,
+            "and nothing was thrown away")
+
+    def test_a_database_with_no_stored_ddl_still_reports_the_mismatch(self):
+        # Everything indexed before the schema text was recorded. It cannot show
+        # a diff, but it must not go quiet either.
+        said = self.announce(None)
+        self.assertIn("0000000000000000", said)
+        self.assertIn("cannot be shown", said)
+
+    def test_the_schema_text_is_stored_so_the_next_mismatch_can_diff(self):
+        said = self.announce(db_module.SCHEMA_TEXT)
+        self.assertEqual(
+            self.reopened(rebuild=False).get_meta(db_module.SCHEMA_DDL_KEY),
+            db_module.SCHEMA_TEXT)
+
+    def test_a_read_only_open_adds_no_keys(self):
+        # The fingerprint is stamped only by an opener that checked or built the
+        # shape. A web reader must not add keys either, or it would leave a
+        # database looking checked that never was.
+        self.announce(db_module.SCHEMA_TEXT,
+                      fingerprint=db_module.SCHEMA_FINGERPRINT)
+        db = self.reopened(rebuild=False)
+        self.assertEqual(db.get_meta(db_module.FINGERPRINT_KEY),
+                         db_module.SCHEMA_FINGERPRINT)
+        self.assertEqual(db.get_meta(db_module.SCHEMA_DDL_KEY),
+                         db_module.SCHEMA_TEXT)
 
 
 class ColdStartRaceTest(_PGTestCase):

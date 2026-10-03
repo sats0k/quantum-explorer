@@ -20,6 +20,7 @@ knowing before reading the SQL below:
   amount a Python int, which is what the rest of the code assumes.
 """
 
+import difflib
 import hashlib
 import json
 import os
@@ -395,12 +396,32 @@ SCHEMA_TABLES = tuple(
 # What identifies "this schema" for DB.initialize. Derived from SCHEMA rather
 # than hand-written, so editing the DDL is enough to make every existing
 # database rebuild -- there is no separate version number to forget to bump.
-# Normalised to strip whitespace so a reindented comment block is not
-# mistaken for a schema change and does not throw away a good chain.
-SCHEMA_FINGERPRINT = hashlib.sha256(
-    "\n".join(" ".join(s.split()) for s in SCHEMA).encode()).hexdigest()[:16]
+#
+# Normalised to collapse whitespace, so reindenting the DDL or a comment block
+# is not mistaken for a schema change.
+#
+# What it does *not* do is ignore comment text: a reworded `--` comment moves
+# the hash exactly as a dropped column does, and both cost a full reindex. That
+# is left deliberately. Hashing less of the DDL would avoid the expensive
+# surprises, but only if the stripper were exactly right, and a stripper that is
+# subtly wrong here maps two genuinely different schemas onto one fingerprint --
+# which is the failure this whole mechanism exists to prevent: a column present
+# with its values missing, read as a valid chain. A needless rebuild costs
+# minutes and is recoverable; a missed one is silently wrong data. So the hash
+# stays over the whole statement and DB._rebuild announces what changed, which
+# makes a comment-only edit a thing you can see rather than infer.
+SCHEMA_TEXT = "\n".join(" ".join(s.split()) for s in SCHEMA)
+
+SCHEMA_FINGERPRINT = hashlib.sha256(SCHEMA_TEXT.encode()).hexdigest()[:16]
 
 FINGERPRINT_KEY = "schema_fingerprint"
+
+# The text that fingerprint was taken over. Not consulted to decide anything --
+# only so that a mismatch can show what changed instead of merely that
+# something did. A database predating this key simply reports no diff.
+SCHEMA_DDL_KEY = "schema_ddl"
+
+
 
 
 ORPHAN_RETENTION = 20000  # tombstones kept this many blocks before pruning
@@ -641,6 +662,11 @@ class DB:
             # a wrong one costs it silently serving the wrong data.
             if rebuild or not existed:
                 self.set_meta(FINGERPRINT_KEY, SCHEMA_FINGERPRINT)
+                # Alongside the fingerprint, not instead of the check: this is
+                # only ever read to explain a mismatch, so writing it only
+                # where the fingerprint is stamped costs nothing and keeps a
+                # read-only opener from claiming a database it did not check.
+                self.set_meta(SCHEMA_DDL_KEY, SCHEMA_TEXT)
         # Steady-state work -- indexing, and every web request -- waits only
         # briefly. A web reader that parks for SCHEMA_LOCK_TIMEOUT_MS turns one
         # long build into 50 requests hanging for half an hour; a blocked caller
@@ -648,6 +674,33 @@ class DB:
         if lock_timeout is None:
             self.conn.execute("SET lock_timeout = '%dms'"
                               % self.NORMAL_LOCK_TIMEOUT_MS)
+
+    def _announce_rebuild(self):
+        """Say that the chain is about to be discarded, and what changed.
+
+        A rebuild is the one operation here that destroys indexed data, and it
+        is reached by a hash comparison that nothing prints. Without this the
+        only symptom is an explorer that has gone empty and is slowly filling
+        again, minutes later, which reads as a crash rather than as a schema
+        change -- and the fingerprint covers comment text, so a reworded
+        comment discards the chain exactly as a dropped column does. Those two
+        want very different reactions, so the announcement carries the diff that
+        tells them apart.
+        """
+        print("warning: schema fingerprint %s != %s; discarding the indexed "
+              "chain and reindexing from genesis"
+              % (self.get_meta(FINGERPRINT_KEY), SCHEMA_FINGERPRINT), flush=True)
+        stored = self.get_meta(SCHEMA_DDL_KEY)
+        if stored is None:
+            print("  no schema text on record for this database, so the "
+                  "difference cannot be shown", flush=True)
+            return
+        for line in difflib.unified_diff(
+                stored.splitlines(), SCHEMA_TEXT.splitlines(),
+                fromfile="schema on disk", tofile="schema in this code",
+                lineterm="", n=1):
+            print("  " + line, flush=True)
+
 
     def _rebuild(self):
         """Throw the database away if it is not the schema this code wants.
@@ -685,6 +738,7 @@ class DB:
             return
         if self.get_meta(FINGERPRINT_KEY) == SCHEMA_FINGERPRINT:
             return
+        self._announce_rebuild()
         # Only tables this schema owns are dropped, and meta is the gate: a
         # database that predates the fingerprint (or carries a stale one) is not
         # known to be a shape this code understands, so it is emptied outright

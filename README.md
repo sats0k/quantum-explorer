@@ -199,7 +199,21 @@ So a client that walks a multisig participant address gets a 404 from
   balance with the entire supply.
 - The trigger is `SCHEMA_FINGERPRINT`, a hash of the `SCHEMA` tuple in `db.py`,
   so editing that DDL is all it takes; there is no version number to remember to
-  bump. The fingerprint is written into `meta` by whichever process can vouch for
+  bump. Whitespace is collapsed first, so reindenting the DDL or a comment block
+  is not a change -- but comment *text* is hashed like anything else, so
+  rewording a `--` comment costs the same full re-sync as dropping a column.
+  That is deliberate: hashing only the executable DDL would mean hand-rolling a
+  SQL comment stripper into the startup path, and one that is subtly wrong maps
+  two different schemas onto one fingerprint, which is the failure the
+  fingerprint exists to prevent. A needless re-sync costs a few minutes and
+  recovers; a missed one is silently wrong balances.
+- Because a comment typo and a dropped column are indistinguishable by hash
+  alone, the indexer prints the reason before it discards anything: both
+  fingerprints, and a diff against the schema text recorded in `meta` under
+  `schema_ddl`. A database indexed before that key existed reports the mismatch
+  without a diff. Nothing is printed when the fingerprints match, so a warning
+  on screen means the chain really is being thrown away.
+- The fingerprint is written into `meta` by whichever process can vouch for
   the shape: the indexer (`DB.initialize(dsn, rebuild=True)`) always, and the web
   server only when it built the schema itself. The web side therefore cannot
   discard a chain, and cannot stamp a database it has not checked either -- if
