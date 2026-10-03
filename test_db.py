@@ -20,6 +20,7 @@ import queue
 import re
 import random
 import shutil
+import socket
 import tempfile
 import threading
 import unittest
@@ -1370,6 +1371,70 @@ class PoolTimeoutTest(DBTestCase):
         out = json.loads(body)
         self.assertEqual(out["tip"]["height"], 0)
         self.assertIn("n_blocks", out)
+
+
+class BindAddressTest(DBTestCase):
+    """Where this binds is a security decision, so it is pinned down.
+
+    The explorer has no authentication at all: every balance, every address and
+    every tx it holds is readable by whoever reaches the socket. The bind
+    address is therefore the only access control there is, which makes "listen
+    on every interface" something to have to ask for rather than something that
+    happens because nobody changed a default.
+
+    It did happen: the default was `::`, which is every interface on both
+    families, while nginx-explorer.conf proxies to 127.0.0.1 and the README
+    pointed at a loopback URL. In that combination the proxy was decorative --
+    port 8080 answered directly and a visitor could skip nginx and get the
+    explorer over plain HTTP.
+    """
+
+    def test_the_default_binds_loopback_and_not_every_interface(self):
+        self.assertEqual(server_module.argument_parser().parse_args([]).host,
+                         "127.0.0.1")
+
+    def test_loopback_addresses_are_not_reported_as_reachable(self):
+        for host in ("127.0.0.1", "127.0.0.2", "::1", "localhost"):
+            self.assertFalse(server_module.reachable_off_machine(host),
+                             "%s is loopback" % host)
+
+    def test_anything_else_is_reported_as_reachable(self):
+        # Deliberately including names we cannot resolve: a hostname could be
+        # anything, and the whole point is not to under-warn.
+        for host in ("::", "0.0.0.0", "", "192.168.2.8", "example.internal",
+                     "localhost.localdomain"):
+            self.assertTrue(server_module.reachable_off_machine(host),
+                            "%s could be reached from outside" % host)
+
+    def test_an_ipv6_url_is_bracketed(self):
+        # An unbracketed IPv6 literal is not a URL anyone can open: the colons
+        # are indistinguishable from the port separator.
+        self.assertEqual(server_module.url_for("127.0.0.1", 8080),
+                         "http://127.0.0.1:8080/")
+        self.assertEqual(server_module.url_for("::1", 8080),
+                         "http://[::1]:8080/")
+        self.assertEqual(server_module.url_for("::", 8080),
+                         "http://[::]:8080/")
+
+    def test_the_socket_type_follows_the_address(self):
+        # An IPv4 literal on an AF_INET6 socket cannot be bound at all, so the
+        # default only works because main() drops to a plain IPv4 socket when
+        # the address has no colon in it.
+        self.assertNotIn(":", "127.0.0.1")
+        self.assertEqual(server_module.DualStackHTTPServer.address_family,
+                         socket.AF_INET6)
+
+    def test_the_shell_default_agrees_with_the_python_one(self):
+        # Two defaults that drift is how this went wrong in the first place, so
+        # the script and the argument parser are read from the same source.
+        with open(os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                               "explorer.sh")) as f:
+            script = f.read()
+        m = re.search(r'WEBHOST="\$\{WEBHOST:-([^}]*)\}"', script)
+        self.assertIsNotNone(m, "explorer.sh no longer sets a WEBHOST default")
+        self.assertEqual(m.group(1), "127.0.0.1",
+                         "explorer.sh and server.py disagree about the bind "
+                         "address")
 
 
 class LockTimeoutTest(DBTestCase):

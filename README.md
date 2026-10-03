@@ -62,7 +62,8 @@ tail -f indexer.log     # follow sync progress
 ```
 
 Any bare argument (or no argument) means `start`. The web UI lands on
-`http://[::1]:8080/`. Settings come from the environment:
+`http://127.0.0.1:8080/` -- loopback only, so it is not reachable from another
+machine unless you set `WEBHOST`. Settings come from the environment:
 
 | Variable    | Default     | Meaning                    |
 | ----------- | ----------- | -------------------------- |
@@ -72,11 +73,13 @@ Any bare argument (or no argument) means `start`. The web UI lands on
 | `RPCHOST`   | `127.0.0.1` | daemon RPC host            |
 | `RPCPORT`   | `9554`      | daemon RPC port            |
 | `EXPLORER_DSN` | `dbname=explorer` | DSN used when none is passed on the command line |
-| `WEBHOST`   | `::`        | web bind address           |
+| `WEBHOST`   | `127.0.0.1` | web bind address; anything else exposes the port |
 | `WEBPORT`   | `8080`      | web port                   |
 
 ```bash
 RPCPORT=9554 WEBPORT=8080 ./explorer.sh start
+# to serve it to the network directly, without a proxy:
+WEBHOST=0.0.0.0 ./explorer.sh start
 ```
 
 Running the two by hand instead:
@@ -100,12 +103,16 @@ syncing new blocks and the mempool until interrupted. Reorgs are handled
 
 ```bash
 python3 server.py 'dbname=explorer' --port 8080
-# open http://127.0.0.1:8080/  (or http://[::1]:8080/ over IPv6)
+# open http://127.0.0.1:8080/
+# (--host ::1 for IPv6 loopback instead)
 ```
 
-The web server binds dual-stack to `::` by default (IPv4 + IPv6). Pass
-`--host 127.0.0.1` for IPv4-only, or `--host 0.0.0.0` to expose it on the
-local network.
+The web server binds **loopback only** (`127.0.0.1`) by default. This
+explorer has no authentication of any kind, so the only thing standing between
+it and the network is the address it binds. Pass `--host 0.0.0.0` (or `--host ::`
+for IPv4 and IPv6) to expose it deliberately; the server prints a warning when
+it is bound anywhere but loopback, and `explorer.sh` says the same when
+`WEBHOST` is not a loopback address.
 
 ### Optional: nginx in front
 
@@ -117,6 +124,12 @@ sudo cp nginx-explorer.conf /etc/nginx/sites-available/explorer
 sudo ln -s /etc/nginx/sites-available/explorer /etc/nginx/sites-enabled/
 sudo nginx -t && sudo systemctl reload nginx
 ```
+
+Leave `WEBHOST` unset, or at `127.0.0.1`, when nginx is in front. This matters
+more than it looks: with `WEBHOST=::` the Python server still listens on every
+interface, so port 8080 answers directly and a visitor can skip nginx entirely
+-- getting the explorer over plain HTTP with no TLS, and any access control the
+nginx block carried. Proxying a wide-open backend does not close it.
 
 ### API
 

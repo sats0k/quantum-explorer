@@ -28,6 +28,7 @@ of the money (a multi-address vout credits no single address).
 
 import argparse
 import contextlib
+import ipaddress
 import json
 import os
 import queue
@@ -80,6 +81,32 @@ def with_hex(balances):
     for key in ("value_received", "value_spent", "balance"):
         balances[key + "_hex"] = poke(balances[key])
     return balances
+
+
+def url_for(host, port):
+    """A URL for `host`:`port` that can actually be opened.
+
+    An IPv6 literal contains colons, which a URL has to bracket, so the
+    unbracketed `http://::1:8080/` that used to be printed at startup was not an
+    address anyone could paste into a browser.
+    """
+    return "http://%s:%d/" % ("[%s]" % host if ":" in host else host, port)
+
+
+def reachable_off_machine(host):
+    """Whether binding `host` lets anything but this machine in.
+
+    Anything not positively a loopback address counts as reachable, because the
+    cost of guessing wrong here is an unnoticed public port and the cost of
+    over-warning is one line in a log. A hostname resolves to something, but
+    which something is not ours to assume, so it is treated as reachable.
+    """
+    if host == "localhost":
+        return False
+    try:
+        return not ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return True
 
 
 # How long a request waits for a pool connection before answering 503. The
@@ -480,12 +507,25 @@ class Handler(BaseHTTPRequestHandler):
         self._send(*res)
 
 
-def main():
+def argument_parser():
+    """The command line, in one place so the defaults can be asserted on.
+
+    `main()` used to build this inline, which left the bind address -- the one
+    setting that decides whether the explorer is reachable from the network --
+    with no way to read it back without starting a server.
+    """
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("dsn", nargs="?", default=DEFAULT_DSN)
-    p.add_argument("--host", default="::")
+    p.add_argument("--host", default="127.0.0.1",
+                   help="address to bind; loopback by default, so exposing "
+                        "this is something you ask for rather than something "
+                        "that happens")
     p.add_argument("--port", type=int, default=8080)
-    args = p.parse_args()
+    return p
+
+
+def main():
+    args = argument_parser().parse_args()
 
     server_cls = DualStackHTTPServer
     if ":" not in args.host:  # literal IPv4 address -> plain IPv4 bind
@@ -499,7 +539,12 @@ def main():
     # (DB.connect opens schema=False), so there is nothing here that has to
     # finish before the port answers.
     httpd = server_cls((args.host, args.port), Handler)
-    print("explorer running on http://%s:%d/" % (args.host, args.port))
+    print("explorer running on %s" % url_for(args.host, args.port))
+    if reachable_off_machine(args.host):
+        print("warning: bound to %s, so this port answers from outside this "
+              "machine and the explorer is served over plain HTTP with no "
+              "authentication -- bind loopback and let a TLS-terminating proxy "
+              "be the public face" % args.host)
 
     try:
         DB.initialize(args.dsn)   # create the schema if nobody else has
