@@ -3352,6 +3352,30 @@ class BulkWindowHazardTest(DBTestCase):
         self.assertEqual(self.spent_by("P1", 0), 1)
         self.assertMatchesDerived("after a chained window")
 
+    def test_a_window_whose_flush_fails_leaves_the_connection_usable(self):
+        # The flush can fail on a connection that is otherwise fine -- a
+        # lock_timeout or statement_timeout on the meta upsert, a serialization
+        # failure. The transaction is then open and aborted, and every statement
+        # on it is refused until it ends, so a connection left that way never
+        # works again: Indexer.run only catches psycopg.Error and retries, so it
+        # would log "transient error" forever and index nothing again.
+        self.block(1)
+        blocker = psycopg.connect(self.db_path)
+        self.addCleanup(blocker.close)
+        # EXCLUSIVE conflicts with the ROW EXCLUSIVE the counter upsert takes.
+        blocker.execute("LOCK TABLE meta IN EXCLUSIVE MODE")
+        self.db.conn.execute("SET statement_timeout = '250ms'")
+        with self.assertRaises(psycopg.Error):
+            with self.db.bulk():
+                self.db.add_tx(tx("T1", 1, [("a", 10 * POKE, 0)], [("prev", 0)]))
+        blocker.rollback()
+        self.db.conn.execute("SET statement_timeout = 0")
+        # The next cycle's statements run, which is the whole point.
+        self.assertEqual(self.db.n_blocks(), 1)
+        self.assertEqual(self.db.tip_height(), 1)
+        self.db.add_tx(tx("T2", 1, [("b", 10 * POKE, 1)], [("prev", 0)]))
+        self.assertMatchesDerived("after a failed flush")
+
     def test_the_same_window_written_twice_over_reaches_the_same_state(self):
         # The property that actually matters: the window is an optimisation,
         # so it must not change the answer. Index a chain in one transaction

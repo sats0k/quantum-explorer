@@ -209,8 +209,22 @@ class _Bulk:
             # counters describing them are part of this transaction, and a
             # commit that left them unwritten would persist a window of blocks
             # with no rows in it and counts that match nothing.
-            db._flush_writes()
-            db.conn.commit()
+            try:
+                db._flush_writes()
+                db.conn.commit()
+            except BaseException:
+                # Either step can fail while the connection stays usable -- a
+                # lock_timeout on the meta upsert, a statement_timeout, a
+                # serialization failure. The transaction is then still open and
+                # aborted, and every statement on it is refused with
+                # InFailedSqlTransaction until it ends, so a connection left
+                # this way never works again: the indexer only catches
+                # psycopg.Error, backs off and retries, so it would log
+                # "transient error" forever and index nothing again. Ending the
+                # transaction here is what makes the next cycle able to run.
+                db._discard_writes()
+                db.conn.rollback()
+                raise
         else:
             db._discard_writes()
             db.conn.rollback()
@@ -429,8 +443,6 @@ FINGERPRINT_KEY = "schema_fingerprint"
 # only so that a mismatch can show what changed instead of merely that
 # something did. A database predating this key simply reports no diff.
 SCHEMA_DDL_KEY = "schema_ddl"
-
-
 
 
 ORPHAN_RETENTION = 20000  # tombstones kept this many blocks before pruning
