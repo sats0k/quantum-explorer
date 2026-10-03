@@ -336,6 +336,15 @@ CREATE TABLE IF NOT EXISTS "scripts" (
     # existing table, which is why no DDL here has to tolerate a column that
     # may not exist yet.
 
+    # status leads because every read that wants it wants only status, and a
+    # mempool is a few dozen rows against 700k txs: the index is what keeps
+    # `WHERE status='mempool'` -- the stale-mempool sweep the indexer runs
+    # every cycle, and the count behind /api/summary's mempool cell, so both a
+    # page load and a sync cycle -- off a sequential scan of the whole table
+    # (measured 118ms over 730k rows here, growing forever). height trails
+    # because the same index also answers the per-height confirmed count
+    # /api/summary and /api/recent_blocks ask for.
+    'CREATE INDEX IF NOT EXISTS idx_txs_status_height ON txs("status", "height")',
     'CREATE INDEX IF NOT EXISTS idx_addr_out_txid_n ON addr_out("txid", "n")',
     'CREATE INDEX IF NOT EXISTS idx_txs_height ON txs("height")',
     'CREATE INDEX IF NOT EXISTS idx_vin_prev ON vin("prev_txid", "prev_vout")',
@@ -376,7 +385,7 @@ CREATE TABLE IF NOT EXISTS "scripts" (
 # (txid, n) index and the whole reorg path unindexed.
 #
 # Not included: the UNIQUE constraints declared inside the blocks and txs
-# CREATE TABLEs (blocks_hash_key, idx_txs_status_height). Those belong to their
+# CREATE TABLEs (blocks_hash_key, txs_pkey). Those belong to their
 # tables and cannot be dropped without dropping the table, which is why the
 # loader empties with TRUNCATE rather than DROP.
 ALL_INDEXES = tuple(
