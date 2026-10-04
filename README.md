@@ -200,13 +200,39 @@ address rather than ask twice.
 - The indexer and web server are separate processes against one PostgreSQL
   database. They are never in the same transaction, so concurrent access needs
   no coordination beyond PostgreSQL's own.
+- Sync is done in bulk windows, and the writes inside one window are buffered
+  until it closes rather than flushed per tx. What a tx must read before it can
+  write -- which prevouts a previous version of that txid held, what status it
+  was stored at, and for a coinbase what it already counted towards the supply
+  -- is therefore read per tx, and that was two round trips each. Those reads
+  decide `released`, `prev_minted` and the `n_txs` delta, so they cannot be
+  skipped or assumed; they can only be asked for a whole window at once, which
+  `DB.prefetch_txs` does, in three round trips per window instead of two per tx.
+  On a chain indexed from genesis the answer is "nothing held" every time, which
+  is exactly the case a per-tx query pays full price for. Each answer is
+  consumed by popping it, so a txid added twice in one window finds its entry
+  gone and reads the live table -- which is what it had to do anyway once the
+  window flushed for its own reads. `clear_from` and `remove_txs` drop the cache
+  rather than reasoning about what it described, since a stale answer to "what
+  did this txid hold" would resurrect a deleted version's inputs and supply.
+- `spent_by` is derived from `vin`, not stored as fact, so `_refresh_spent_flags`
+  writes a row only when the mask it computed differs from the one already held.
+  Without that, indexing from genesis rewrote every unspent output of every
+  transaction to the value it already had -- a new row version and two index
+  entries each, for no change. The recompute is evaluated per row against the
+  post-delete `vin`, and the `WHERE` arm repeats the `CASE` rather than sharing
+  it, because a subquery in `SET` sees the pre-`UPDATE` snapshot; skipping a
+  write has to compare against what the row actually holds.
+- Sync is now insert-bound. What remains of a window is the buffered
+  `INSERT ... ON CONFLICT` statements at the flush, already batched. `COPY`
+  would cut those further, but it cannot express the upserts or the deferred
+  flag recompute, so it is a larger change than a query-level one.
 - **There are no migrations.** The schema is never altered in place. Changing
   it means a shape change is detected on the next indexer start, the tables are
-  dropped, and the chain is re-synced from genesis (a few minutes; this chain is
-  ~409k blocks). What that buys is the deletion of every in-place migration path
-  and with it the failure mode where one adds a column with a default and
-  leaves it unbackfilled -- which reads as a correct database and answers every
-  balance with the entire supply.
+  dropped, and the chain is re-synced from genesis. What that buys is the
+  deletion of every in-place migration path and with it the failure mode where
+  one adds a column with a default and leaves it unbackfilled -- which reads as
+  a correct database and answers every balance with the entire supply.
 - The trigger is `SCHEMA_FINGERPRINT`, a hash of the `SCHEMA` tuple in `db.py`,
   so editing that DDL is all it takes; there is no version number to remember to
   bump. Whitespace is collapsed first, so reindenting the DDL or a comment block
