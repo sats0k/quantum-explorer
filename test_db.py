@@ -176,7 +176,7 @@ class FakeDaemon:
             raise RPCError("Block height out of range")
         return self.hash_at(height)
 
-    def getblock(self, blockhash):
+    def getblock(self, blockhash, verbosity=1):
         height = int(blockhash[1:])
         return {"height": height, "hash": self.hash_at(height), "tx": [],
                 "previousblockhash":
@@ -185,16 +185,25 @@ class FakeDaemon:
     def getrawmempool(self):
         return list(self.mempool)
 
-    def getrawtransaction(self, txid, verbose=True):
-        self.fetched.append(txid)
-        if txid not in self.mempool:
-            raise RPCError("No such mempool transaction: %s" % txid)
+    def tx_detail(self, txid):
+        """A decoded transaction, as it appears in a verbosity=2 block reply.
+
+        Independent of the mempool, so a block's transactions can be decoded
+        whether or not they are unconfirmed.
+        """
         return {"txid": txid, "version": 1, "locktime": 0, "size": 100,
+                "hex": "00" * 50,
                 "vin": [{"txid": "prev", "vout": 0, "sequence": 0xFFFFFFFF}],
                 "vout": [{"value": Decimal("1.5"), "n": 0,
                           "scriptPubKey": {
                               "type": "pubkeyhash", "addresses": ["addr1"],
                               "reqSigs": 1, "asm": "OP_DUP", "hex": "76a914"}}]}
+
+    def getrawtransaction(self, txid, verbose=True):
+        self.fetched.append(txid)
+        if txid not in self.mempool:
+            raise RPCError("No such mempool transaction: %s" % txid)
+        return self.tx_detail(txid)
 
     def batch(self, calls, strict=True):
         out = []
@@ -208,9 +217,14 @@ class FakeDaemon:
         return out
 
 
-def block_at(daemon, height, txids=()):
+def block_at(daemon, height, txids=(), decoded=False):
+    """A block reply as the daemon would send it.
+
+    `decoded=True` models a daemon honouring getblock verbosity=2, whose `tx`
+    entries are fully decoded transaction objects instead of bare txids.
+    """
     return {"height": height, "hash": daemon.hash_at(height),
-            "tx": list(txids),
+            "tx": [daemon.tx_json(t) for t in txids] if decoded else list(txids),
             "previousblockhash":
                 daemon.hash_at(height - 1) if height else None}
 
@@ -223,9 +237,24 @@ class BlockDaemon(FakeDaemon):
         super().__init__(tip, **kw)
         self.txids_at = txids_at
 
-    def getblock(self, blockhash):
+    # Set False to model a daemon that has no getblock verbosity argument and
+    # so hands back bare txids, sending the indexer down its per-tx fallback.
+    decoded_blocks = True
+
+    def getblock(self, blockhash, verbosity=1):
         height = int(blockhash[1:])
-        return block_at(self, height, self.txids_at.get(height, ()))
+        return block_at(self, height, self.txids_at.get(height, ()),
+                        decoded=self.decoded_blocks)
+
+    def tx_json(self, txid):
+        """The decoded transaction object a verbosity=2 block reply carries."""
+        return self.tx_detail(txid)
+
+    def getrawtransaction(self, txid, verbose=True):
+        # Resolves anything its blocks name, as a real daemon does for a
+        # confirmed tx, so the no-verbosity fallback has something to find.
+        self.fetched.append(txid)
+        return self.tx_detail(txid)
 
 
 def script_hex(tag):
@@ -2465,12 +2494,93 @@ class MempoolRefreshTest(DBTestCase):
             "SELECT status FROM txs WHERE txid='M'")[0][0], "mempool")
 
 
+class BlockVerbosityTest(DBTestCase):
+    """getblock verbosity=2 hands back the window's transactions decoded.
+
+    The chain sync used to ask per transaction, which on a real window of 100
+    blocks is ~880 extra round trips and ~1.4s of the ~1.5s the window cost.
+    Reading them off the block reply removes both, and as a side effect removes
+    the case that needed a placeholder: a confirmed tx whose outputs are all
+    spent cannot be fetched by txid at all (this fork has no -txindex), which is
+    why the genesis coinbase used to be stored without inputs or outputs.
+    """
+
+    def daemon(self, decoded):
+        d = BlockDaemon(2, {1: ["CB", "A"], 2: ["B"]})
+        d.decoded_blocks = decoded
+        self.indexer.rpc = d
+        return d
+
+    def test_transactions_are_taken_from_the_block_reply(self):
+        d = self.daemon(True)
+        self.indexer.sync_blocks()
+        self.assertEqual(d.fetched, [],
+                         "a verbosity=2 window must need no per-tx lookup")
+        self.assertEqual(self.db.query(
+            "SELECT txid FROM txs WHERE status='confirmed' ORDER BY txid"),
+            [("A",), ("B",), ("CB",)])
+
+    def test_every_field_is_stored_not_just_the_txid(self):
+        self.daemon(True)
+        self.indexer.sync_blocks()
+        # size, version, locktime and the outputs all have to survive, or the
+        # chain index silently loses data the old per-tx path recorded.
+        self.assertEqual(self.db.query(
+            "SELECT size, version FROM txs WHERE txid='A'"), [(100, 1)])
+        self.assertEqual(self.db.query(
+            "SELECT COUNT(*) FROM addr_out WHERE txid='A'")[0][0], 1)
+
+    def test_a_spent_coinbase_is_stored_in_full_rather_than_stubbed(self):
+        # The genesis coinbase is the guaranteed instance: nothing ever spends
+        # it back, so a lookup by txid can never resolve it and it used to be
+        # stored with no inputs or outputs at all.
+        class Genesis(BlockDaemon):
+            def tx_detail(self, txid):
+                d = FakeDaemon.tx_detail(self, txid)
+                d["vin"] = [{"coinbase": "00deadbeef", "sequence": 0xFFFFFFFF}]
+                return d
+
+        self.indexer.rpc = Genesis(0, {0: ["CB"]})
+        self.indexer.sync_blocks()
+        self.assertEqual(self.indexer.counters["tx_stub"], 0)
+        self.assertEqual(self.db.query(
+            "SELECT txid, is_coinbase FROM txs WHERE height=0"), [("CB", True)])
+        self.assertEqual(self.db.query(
+            "SELECT COUNT(*) FROM addr_out WHERE txid='CB'")[0][0], 1)
+
+    def test_a_daemon_without_verbosity_still_works(self):
+        # An older daemon rejects the second argument, so the indexer has to
+        # fall back rather than fail the window.
+        d = self.daemon(False)
+        self.indexer.sync_blocks()
+        self.assertEqual(self.db.tip_height(), 2)
+        self.assertEqual(sorted(d.fetched), ["A", "B", "CB"])
+
+    def test_a_daemon_that_rejects_the_argument_falls_back(self):
+        class NoVerbosity(BlockDaemon):
+            def getblock(self, blockhash, verbosity=1):
+                if verbosity != 1:
+                    raise RPCError("getblock takes 1 argument")
+                return BlockDaemon.getblock(self, blockhash)
+
+        d = NoVerbosity(2, {1: ["CB", "A"], 2: ["B"]})
+        self.indexer.rpc = d
+        self.indexer.sync_blocks()
+        self.assertEqual(self.db.tip_height(), 2)
+        self.assertEqual(self.db.query(
+            "SELECT COUNT(*) FROM txs WHERE status='confirmed'")[0][0], 3)
+
+
 class TxRetrievalDialogTest(DBTestCase):
     """How sync_blocks treats a getrawtransaction that refuses mid-window.
 
     A per-slot refusal inside a successful batch used to stub the tx forever;
     the daemon's "no information" (permanent) and a transient hiccup were
     indistinguishable. The stub answer first pass, the rest are re-asked.
+
+    These run against a daemon that hands back bare txids from getblock, i.e.
+    no verbosity support, because that is the only path that asks for
+    transactions by id any more.
     """
 
     def vers(self, txid):
@@ -2484,6 +2594,7 @@ class TxRetrievalDialogTest(DBTestCase):
     def daemon(self, txids, fail):
         """Block 1 carries `txids`; fail(txid, call_no) raises or returns None."""
         daemon = BlockDaemon(1, {1: txids})
+        daemon.decoded_blocks = False
         calls = {}
 
         def getrawtransaction(txid, verbose=True):

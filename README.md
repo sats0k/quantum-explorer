@@ -5,7 +5,7 @@ pure Python with PostgreSQL storage. The only dependency is `psycopg` (psycopg3)
 everything else is the standard library.
 
 Hybrid transactions are supported **for free**: the indexer stores the
-daemon's own verbose `getrawtransaction` output, which already decodes the
+daemon's own decoded `getblock` output, which already decodes the
 hybrid script templates (`hybrid_pubkey`, `hybrid_pubkeyhash`,
 `hybrid_multisig`) and hybrid address prefixes (`0x3A` / `0x6A`). No
 script parsing is reimplemented on the explorer side.
@@ -278,9 +278,18 @@ address rather than ask twice.
 - Identifier columns are declared `COLLATE "C"` so ordering is bytewise, which
   is what the SQLite `BINARY` collation did. The database's own locale does not
   change how hashes or addresses sort.
-- The Phoenixcoin Quantum daemon has no `-txindex`, so
-  `getrawtransaction` can only resolve confirmed txs that still have
-  unspent outputs. A tx whose outputs are all spent (the genesis coinbase
-  is the guaranteed one) cannot be resolved; the indexer retries it briefly
-  (3 tries, 0.5 s backoff) to ride out transient failures, then stores it by
-  txid alone with no inputs/outputs, logging how many it had to store that way.
+- The Phoenixcoin Quantum daemon has no `-txindex` (the flag is absent from
+  the binary and nothing populates the tx index), so `getrawtransaction` can
+  only resolve confirmed txs that still have unspent outputs. A tx whose
+  outputs are all spent -- the genesis coinbase is the guaranteed one -- cannot
+  be resolved by txid at all. The chain sync no longer asks per txid: it reads
+  transactions out of `getblock <hash> 2`, which returns them decoded inside the
+  block reply and so cannot fail this way. The placeholder and the retry loop
+  survive only on the fallback path, taken when a daemon has no verbosity
+  argument at all (see below).
+- `getblock` takes an optional second argument, `verbosity`: `1` (the default,
+  and what this explorer assumes) returns bare txids, `2` returns decoded
+  transaction objects, `0` returns the serialised block as hex. The chain sync
+  asks for `2` and falls back to a per-tx `getrawtransaction` if the daemon
+  rejects the argument, so an unpatched daemon still works -- just slower, and
+  with the genesis coinbase stored without inputs/outputs.

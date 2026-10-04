@@ -1,8 +1,11 @@
 """Chain + mempool indexer.
 
-Walks the daemon's JSON-RPC from height 0 to the tip, resolving every
-txid through verbose getrawtransaction and storing the (already decoded
-by the daemon) script types/addresses into PostgreSQL. Re-runs pick up
+Walks the daemon's JSON-RPC from height 0 to the tip, storing the
+transactions it decodes into PostgreSQL. Chain transactions arrive inside
+the block reply (`getblock <hash> 2`), so a window costs one RPC call per
+block rather than one per block plus one per tx; mempool transactions,
+which have no block, are still fetched individually. The (already decoded
+by the daemon) script types/addresses are stored as given. Re-runs pick up
 where it stopped; the mempool is refreshed each cycle.
 
 Usage:
@@ -23,7 +26,7 @@ from decimal import Decimal
 
 import psycopg
 
-from rpc import CallError, RPC, RPCError
+from rpc import RPC, RPCError
 from db import DB, COIN, DEFAULT_DSN
 
 TX_TYPES_WITH_ADDRESSES = {
@@ -84,7 +87,10 @@ class Block:
         self.size = j.get("size")
         self.prev_hash = j.get("previousblockhash")
         self.next_hash = j.get("nextblockhash")
-        self.txids = j.get("tx", [])
+        # verbosity=2 puts a decoded transaction object in each slot; verbosity=1
+        # (or no argument) puts a bare txid string. Both are accepted so the
+        # indexer still works against a daemon without the verbosity argument.
+        self.txs = j.get("tx", [])
 
 
 def tx_from_verbose(j, height, tx_index):
@@ -144,11 +150,12 @@ def amount_to_pokes(raw):
 def tx_stub(txid, height, tx_index, is_coinbase):
     """Placeholder for a tx the daemon will not hand out.
 
-    This fork is built without -txindex (no such arg in the binary, and
-    `getrawtransaction` falls back to the utxo view), so a confirmed tx whose
-    outputs are ALL spent is unretrievable -- the genesis coinbase is the one
-    guaranteed case. Store the txid so the block view and tx counts stay
-    complete, with no vin/vout rather than a crash.
+    Only reachable on the fallback path, against a daemon with no getblock
+    verbosity argument. This fork is built without -txindex (no such arg in the
+    binary, and `getrawtransaction` falls back to the utxo view), so a confirmed
+    tx whose outputs are ALL spent is unretrievable there -- the genesis
+    coinbase is the one guaranteed case. Store the txid so the block view and
+    tx counts stay complete, with no vin/vout rather than a crash.
     """
     return Tx(txid, height, tx_index, None, None, None, is_coinbase, [], [])
 
@@ -167,16 +174,14 @@ def _stub_worthy(e):
     # the tx (this fork has no -txindex, so a confirmed tx with all outputs
     # spent is permanently unretrievable) -- is worth stubbing on the first
     # pass. Anything else is a transient refusal and gets the retry loop.
-    if e.code == -5:
-        return True
-    return "no information available about transaction" in e.message.lower()
+    # Matched on the message: a single-call RPCError carries only its text,
+    # whereas a batch slot also carries a numeric code (-5).
+    return "no information available about transaction" in str(e).lower()
 
 
-def tx_from_rpc(rpc, txid, height, tx_index):
-    j = rpc.getrawtransaction(txid, verbose=True)
-    if j is None:
-        return tx_stub(txid, height, tx_index, tx_index == 0)
-    return tx_from_verbose(j, height, tx_index)
+def _slot_txid(t):
+    """The txid of a getblock `tx` slot, decoded object or bare string."""
+    return t.get("txid") if isinstance(t, dict) else t
 
 
 class Indexer:
@@ -187,6 +192,28 @@ class Indexer:
         # Set by SIGTERM/SIGINT handler; run() checks it between units of
         # work (never inside a bulk transaction) and exits cleanly.
         self._stop = threading.Event()
+        # Ask for decoded transactions inside the block reply. Dropped to 1 the
+        # first time a daemon refuses the argument, and remembered, so the
+        # fallback is paid for once rather than once per window.
+        self._verbosity = 2
+
+    def get_blocks(self, hashes):
+        """Blocks by hash, with their transactions already decoded.
+
+        A daemon without the verbosity argument answers with bare txids (or
+        refuses the extra parameter outright); both are handled here so the
+        caller's per-tx fallback only has to recognise a txid in a `tx` slot.
+        """
+        try:
+            return self.rpc.batch(
+                [("getblock", (bh, self._verbosity)) for bh in hashes])
+        except RPCError:
+            if self._verbosity == 1:
+                raise
+            self._verbosity = 1
+            print("daemon has no getblock verbosity argument, falling back "
+                  "to one lookup per tx")
+            return self.rpc.batch([("getblock", (bh,)) for bh in hashes])
 
     def store_stub(self, txid, height, tx_index, exhausted=False):
         """Write the placeholder for a tx we will never detail, and count it."""
@@ -200,6 +227,36 @@ class Indexer:
                 print("no txindex: %s at height %d is not retrievable, "
                       "storing it without inputs/outputs" % (txid, height))
         self.db.add_tx(tx_stub(txid, height, tx_index, tx_index == 0))
+
+    def add_tx_by_txid(self, height, tx_index, txid):
+        """Fallback for a daemon with no getblock verbosity support.
+
+        The transaction is fetched one RPC call at a time, since there is no
+        batched block reply to take it from. A refusal that will never clear
+        (this fork has no -txindex, so a confirmed tx whose outputs are all
+        spent cannot be retrieved) is stubbed straight away; anything else gets
+        the bounded retry loop before being stubbed, so one transient hiccup
+        does not permanently cost a transaction its inputs and outputs.
+        """
+        for attempt in range(_TX_RETRIES):
+            if attempt:
+                time.sleep(_TX_BACKOFF * attempt)
+            try:
+                j = self.rpc.getrawtransaction(txid, verbose=True)
+            except RPCError as e:
+                if _stub_worthy(e):
+                    self.store_stub(txid, height, tx_index)
+                    return True
+                continue
+            if j is None:
+                self.store_stub(txid, height, tx_index)
+                return True
+            self.db.add_tx(tx_from_verbose(j, height, tx_index))
+            return True
+        # Retries exhausted for a refusal that never said "not found": store
+        # the row, lose the detail, rather than hold the window open forever.
+        self.store_stub(txid, height, tx_index, exhausted=True)
+        return False
 
     def sync_blocks(self, batch_size=100):
         # Stubs found during THIS call, not the running total: the counters
@@ -250,7 +307,15 @@ class Indexer:
             for start in range(synced + 1, tip + 1, batch_size):
                 heights = list(range(start, min(start + batch_size, tip + 1)))
                 hashes = self.rpc.batch([("getblockhash", (h,)) for h in heights])
-                blocks = self.rpc.batch([("getblock", (bh,)) for bh in hashes])
+                # verbosity=2 returns the block's transactions already decoded
+                # inside the block reply, so a window costs one RPC call per
+                # block instead of one per block plus one per transaction. On
+                # real data that is ~880 fewer calls per 100 blocks.
+                blocks = self.get_blocks(hashes)
+                txlist = []
+                for h, j in zip(heights, blocks):
+                    for i, t in enumerate(Block(j).txs):
+                        txlist.append((h, i, t))
                 with self.db.bulk():
                     for h, bh, j in zip(heights, hashes, blocks):
                         blk = Block(j)
@@ -260,12 +325,8 @@ class Indexer:
                             return
                         self.db.add_block(blk)
                         prev_hash = bh
-                    # Fetch all txs for this window in (large) batches.
-                    txlist = []
-                    for h, j in zip(heights, blocks):
-                        blk = Block(j)
-                        for i, txid in enumerate(blk.txids):
-                            txlist.append((h, i, txid))
+                    # The window's transactions are already in hand: a
+                    # verbosity=2 slot is the decoded transaction object.
                     # Ask once, for every txid in the window, what each of them
                     # already held. Inside the block, add_tx makes two round
                     # trips per tx to find out -- and on a chain being indexed
@@ -273,44 +334,17 @@ class Indexer:
                     # is exactly the case two round trips per tx cannot notice.
                     # Done before the window's first add_tx, so the reads see
                     # the same rows they would have seen individually.
-                    self.db.prefetch_txs(txid for _, _, txid in txlist)
-                    for i in range(0, len(txlist), 500):
-                        chunk = txlist[i:i + 500]
-                        pending = chunk
-                        for attempt in range(_TX_RETRIES):
-                            if not pending:
-                                break
-                            if attempt:
-                                time.sleep(_TX_BACKOFF * attempt)
-                            txs = self.rpc.batch(
-                                [("getrawtransaction", (txid, 1))
-                                 for _, _, txid in pending],
-                                strict=False)
-                            still = []
-                            for (h, idx, txid), j in zip(pending, txs):
-                                if not isinstance(j, CallError):
-                                    self.db.add_tx(tx_from_verbose(j, h, idx))
-                                elif _stub_worthy(j):
-                                    # Unretrievable tx (no -txindex, all
-                                    # outputs spent), and the refusal is not
-                                    # going to clear: keep the row, lose the
-                                    # detail, no point re-asking.
-                                    self.store_stub(txid, h, idx)
-                                    stubs += 1
-                                else:
-                                    # Not "no information" -- a transient
-                                    # refusal, so whether the slots succeed
-                                    # for everyone else gets another try
-                                    # before anything is given up on.
-                                    still.append((h, idx, txid))
-                            pending = still
-                        for h, idx, txid in pending:
-                            # Retries exhausted for a refusal that never said
-                            # "not found": store the row, lose the detail,
-                            # rather than hold the window open forever.
-                            self.store_stub(txid, h, idx, exhausted=True)
-                            stubs += 1
-                        self.counters["tx"] += len(chunk)
+                    self.db.prefetch_txs(
+                        _slot_txid(t) for _, _, t in txlist)
+                    for h, idx, t in txlist:
+                        if isinstance(t, dict):
+                            self.db.add_tx(tx_from_verbose(t, h, idx))
+                        else:
+                            # Daemon without verbosity support: fall back to a
+                            # per-tx lookup, stubbing whatever it won't hand out.
+                            if not self.add_tx_by_txid(h, idx, t):
+                                stubs += 1
+                        self.counters["tx"] += 1
                 self.counters["block"] += len(heights)
                 print("height %d" % min(heights))
                 if self._stop.is_set():
@@ -318,7 +352,8 @@ class Indexer:
             self.db.set_meta("last_sync", int(time.time()))
         if stubs:
             print("note: %d tx(s) stored without inputs/outputs "
-                  "(getrawtransaction could not resolve them)" % stubs)
+                  "(the daemon's getblock had no verbosity argument and "
+                  "getrawtransaction could not resolve them)" % stubs)
 
     def sync_mempool(self):
         try:
