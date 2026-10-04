@@ -849,6 +849,18 @@ class DB:
         of OR terms, and the EXISTS is still evaluated per row against the
         post-delete vin table -- the same answer the loop gave, in ~n/250
         statements.
+        #
+        # The second WHERE arm writes a row only when the mask it computed is not
+        # the mask the row already carries. An output inserted and never spent --
+        # most of them, on a chain being indexed for the first time -- is asked
+        # to become what it already is, and every such row written is a new row
+        # version and a new index entry in both tables for nothing. The answer
+        # is identical either way, since spent_by is derived: the value compared
+        # against is the one the same expression produces. The CASE arms are
+        # duplicated rather than shared because a subquery in SET is evaluated
+        # against the pre-UPDATE snapshot while the same subquery in WHERE sees
+        # the same table, and skipping a write has to compare against what the
+        # row actually holds.
         """
         outputs = list(dict.fromkeys(tuple(o) for o in outputs))
         per = max(1, SQL_VAR_CHUNK // 2)       # two binds per (txid, n) pair
@@ -883,9 +895,25 @@ class DB:
                                    AND vin.prev_vout = %s.n
                                    AND txs.status = 'mempool')
                               THEN 2 ELSE 0 END)
-                       WHERE (%s.txid, %s.n) IN (SELECT txid, n FROM p)"""
+                       WHERE (%s.txid, %s.n) IN (SELECT txid, n FROM p)
+                         AND %s.spent_by IS DISTINCT FROM
+                             (CASE WHEN EXISTS (
+                                 SELECT 1 FROM vin
+                                 JOIN txs ON txs.txid = vin.txid
+                                 WHERE vin.prev_txid = %s.txid
+                                   AND vin.prev_vout = %s.n
+                                   AND txs.status = 'confirmed')
+                              THEN 1 ELSE 0 END)
+                             | (CASE WHEN EXISTS (
+                                 SELECT 1 FROM vin
+                                 JOIN txs ON txs.txid = vin.txid
+                                 WHERE vin.prev_txid = %s.txid
+                                   AND vin.prev_vout = %s.n
+                                   AND txs.status = 'mempool')
+                              THEN 2 ELSE 0 END)"""
                     % (",".join(["(?,?::bigint)"] * len(chunk)), table,
-                       table, table, table, table, table, table),
+                       table, table, table, table, table, table,
+                       table, table, table, table, table),
                     binds)
 
     def _delete_tx_rows(self, txids):

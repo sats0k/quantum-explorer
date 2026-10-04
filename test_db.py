@@ -3521,3 +3521,66 @@ class PrefetchReindexTest(DBTestCase):
         window(2, True)
         self.assertEqual(self.spent_by("C1"), 1)
         self.assertMatchesDerived("after re-adding a truncated tx")
+
+
+class SpentFlagSkipTest(DBTestCase):
+    """The refresh must not leave a row stale when it skips writing one.
+
+    _refresh_spent_flags skips a row whose mask is already what it computed --
+    the overwhelmingly common case on a fresh chain, where an output is
+    inserted and never spent. These are the cases where skipping has to be
+    wrong if it is going to be wrong at all: a mask that must move 0 -> 1, 1 ->
+    0, and the confirmed-vs-mempool distinction between the two.
+    """
+
+    def spent(self, txid, n=0):
+        return self.db.conn.execute(
+            "SELECT spent_by FROM addr_out WHERE txid=? AND n=?", (txid, n)
+        ).fetchone()[0]
+
+    def mask(self, txid, n=0):
+        return self.db.conn.execute(
+            "SELECT spent_by FROM vout WHERE txid=? AND n=?", (txid, n)
+        ).fetchone()[0]
+
+    def test_a_mask_that_must_move_is_written(self):
+        with self.db.bulk():
+            self.db.add_tx(tx("C1", 1, [("m", 50 * POKE, 0)], coinbase=True))
+            self.db.add_tx(tx("T1", 1, [("p", 40 * POKE, 0)], [("C1", 0)]))
+        self.assertEqual(self.spent("C1"), 1)
+        self.assertEqual(self.mask("C1"), 1)
+
+    def test_a_mask_that_must_move_back_is_written(self):
+        with self.db.bulk():
+            self.db.add_tx(tx("C1", 1, [("m", 50 * POKE, 0)], coinbase=True))
+            self.db.add_tx(tx("T1", 1, [("p", 40 * POKE, 0)], [("C1", 0)]))
+        self.assertEqual(self.spent("C1"), 1)
+        # Evicting the spender must clear the flag in both tables.
+        self.db.remove_txs(["T1"])
+        self.assertEqual(self.spent("C1"), 0)
+        self.assertEqual(self.mask("C1"), 0)
+        self.assertMatchesDerived("after evicting a spender")
+
+    def test_a_mempool_spender_is_not_a_confirmed_one(self):
+        with self.db.bulk():
+            self.db.add_tx(tx("C1", 1, [("m", 50 * POKE, 0)], coinbase=True))
+        with self.db.bulk():
+            self.db.add_tx(tx("T1", None, [("p", 40 * POKE, 0)], [("C1", 0)]))
+        self.assertEqual(self.mask("C1"), 2, "mempool spender only")
+
+    def test_the_recompute_is_the_ground_truth_after_all_of_it(self):
+        with self.db.bulk():
+            self.db.add_tx(tx("C1", 1, [("m", 50 * POKE, 0)], coinbase=True))
+            self.db.add_tx(tx("C2", 1, [("m", 50 * POKE, 1)], coinbase=True))
+            self.db.add_tx(tx("T1", 1, [("p", 40 * POKE, 0)], [("C1", 0)]))
+            self.db.add_tx(tx("T2", None, [("p", 40 * POKE, 1)], [("C2", 0)]))
+        # What the write paths maintained, before anything recomputes them.
+        maintained = {t: (self.spent(t), self.mask(t))
+                      for t in ("C1", "C2", "T1", "T2")}
+        full_spent_recompute(self.db)
+        for t, expected in maintained.items():
+            self.assertEqual((self.spent(t), self.mask(t)), expected,
+                             "%s: a skipped row disagreed with the recompute"
+                             % t)
+        self.assertEqual(maintained["C1"], (1, 1))
+        self.assertEqual(maintained["C2"], (2, 2))
