@@ -45,6 +45,28 @@ def script_hash_of(script_hex):
     return hashlib.new("ripemd160", hashlib.sha256(b).digest()).hexdigest()
 
 
+def _min_height(a, b):
+    """The lower of two heights, with NULL losing to a real value.
+
+    Mirrors Postgres LEAST(), which skips NULL arguments: a mempool row must
+    not erase a confirmed height, and must not fabricate one either.
+    """
+    if a is None:
+        return b
+    if b is None:
+        return a
+    return a if a <= b else b
+
+
+def _max_height(a, b):
+    """The higher of two heights, with the same NULL handling as _min_height."""
+    if a is None:
+        return b
+    if b is None:
+        return a
+    return a if a >= b else b
+
+
 def _bind(sql):
     """Rewrite qmark placeholders as the driver's format placeholders.
 
@@ -469,6 +491,23 @@ SQL_INSERT_ADDR_OUT = """INSERT INTO addr_out
        (address, txid, n, value, type, mempool)
        VALUES (?,?,?,?,?,?)"""
 
+# Tables whose insert has no ON CONFLICT clause, mapped to the COPY form of the
+# same statement. COPY skips the per-row parameter binding and the extended
+# query protocol: psycopg3 sends it as a stream, which is roughly a third of
+# the cost per row. Only safe where there is nothing to reconcile on conflict --
+# scripts upserts two heights per row and stays on executemany.
+COPY_INSTEAD = {
+    SQL_INSERT_TXS: "COPY txs (txid, height, tx_index, version, locktime,"
+                    " size, is_coinbase, status) FROM STDIN",
+    SQL_INSERT_VIN: "COPY vin (txid, n, prev_txid, prev_vout, coinbase,"
+                    " script_asm, script_hex, sequence) FROM STDIN",
+    SQL_INSERT_VOUT: "COPY vout (txid, n, value, type, addresses, req_sigs,"
+                     " script_asm, script_hex, script_hash, mempool)"
+                     " FROM STDIN",
+    SQL_INSERT_ADDR_OUT: "COPY addr_out (address, txid, n, value, type,"
+                         " mempool) FROM STDIN",
+}
+
 SQL_INSERT_SCRIPTS = """INSERT INTO scripts
        (script_hash, type, req_sigs, addresses,
         created_height, last_height)
@@ -542,6 +581,16 @@ STATS = (
 # is how the tests drive real chunking on a server whose own limit is too high
 # to reach.
 SQL_VAR_CHUNK = 500
+
+# How many (txid, n) pairs go into one _refresh_spent_flags statement. This is
+# not SQL_VAR_CHUNK // 2 any more, and the reason is what the grouped form costs.
+# It derives each mask by scanning the target table once per statement, so the
+# price of a window is set by how many statements it takes, not by how many rows
+# they carry: on a 4000-pair window, 32 statements took 1.2s and 2 took 0.37s.
+# The ceiling is the protocol's bind limit -- two binds per pair against
+# PostgreSQL's 65535-parameter cap -- and 8192 sits far enough under it to be
+# safe while still covering a window in one or two statements.
+FLAG_PAIR_CHUNK = 8192
 
 
 def _chunks(seq, size=None):
@@ -863,58 +912,94 @@ class DB:
         # row actually holds.
         """
         outputs = list(dict.fromkeys(tuple(o) for o in outputs))
-        per = max(1, SQL_VAR_CHUNK // 2)       # two binds per (txid, n) pair
+        per = FLAG_PAIR_CHUNK
         for i in range(0, len(outputs), per):
             chunk = outputs[i:i + per]
             binds = [x for pair in chunk for x in pair]
             for table in ("addr_out", "vout"):
-                # Two EXISTS rather than one scan of vin grouped by output: the
-                # pairs are already bounded by the chunk, and a group-by would
-                # have to walk every vin row sharing the output. The status is
-                # read through txs because a vin row's own status is its
-                # owner's, which is the thing being asked about here.
+                # The status is read through txs because a vin row's own status is
+                # its owner's, which is the thing being asked about here.
                 #
                 # The ::bigint on each VALUES row is what gives the CTE its
                 # column types: Postgres infers an undecorated parameter as
                 # text, and n has to come out bigint to compare with the
                 # bigint columns it is matched against.
+                #
+                # One grouped probe per pair rather than two correlated EXISTS
+                # per row: the pairs in the chunk are already bounded, so ask
+                # vin once for all of them and derive the mask by MAX over the
+                # spenders' status. The LEFT JOIN keeps a pair nothing spends
+                # in the result with a zero mask, which is what lets an output
+                # move back to unspent.
                 self.conn.execute(
-                    """WITH p(txid, n) AS (VALUES %s)
-                       UPDATE %s SET spent_by =
-                           (CASE WHEN EXISTS (
-                                 SELECT 1 FROM vin
-                                 JOIN txs ON txs.txid = vin.txid
-                                 WHERE vin.prev_txid = %s.txid
-                                   AND vin.prev_vout = %s.n
-                                   AND txs.status = 'confirmed')
-                              THEN 1 ELSE 0 END)
-                         | (CASE WHEN EXISTS (
-                                 SELECT 1 FROM vin
-                                 JOIN txs ON txs.txid = vin.txid
-                                 WHERE vin.prev_txid = %s.txid
-                                   AND vin.prev_vout = %s.n
-                                   AND txs.status = 'mempool')
-                              THEN 2 ELSE 0 END)
-                       WHERE (%s.txid, %s.n) IN (SELECT txid, n FROM p)
-                         AND %s.spent_by IS DISTINCT FROM
-                             (CASE WHEN EXISTS (
-                                 SELECT 1 FROM vin
-                                 JOIN txs ON txs.txid = vin.txid
-                                 WHERE vin.prev_txid = %s.txid
-                                   AND vin.prev_vout = %s.n
-                                   AND txs.status = 'confirmed')
-                              THEN 1 ELSE 0 END)
-                             | (CASE WHEN EXISTS (
-                                 SELECT 1 FROM vin
-                                 JOIN txs ON txs.txid = vin.txid
-                                 WHERE vin.prev_txid = %s.txid
-                                   AND vin.prev_vout = %s.n
-                                   AND txs.status = 'mempool')
-                              THEN 2 ELSE 0 END)"""
+                    """WITH p(txid, n) AS (VALUES %s),
+                       s AS (SELECT p.txid AS txid, p.n AS n,
+                               COALESCE(MAX(CASE WHEN txs.status = 'confirmed'
+                                     THEN 1 ELSE 0 END), 0)
+                               | COALESCE(MAX(CASE WHEN txs.status = 'mempool'
+                                     THEN 2 ELSE 0 END), 0) AS m
+                              FROM p
+                              LEFT JOIN vin ON vin.prev_txid = p.txid
+                                   AND vin.prev_vout = p.n
+                              LEFT JOIN txs ON txs.txid = vin.txid
+                              GROUP BY p.txid, p.n)
+                       UPDATE %s SET spent_by = s.m
+                       FROM s WHERE %s.txid = s.txid AND %s.n = s.n
+                         AND %s.spent_by IS DISTINCT FROM s.m"""
                     % (",".join(["(?,?::bigint)"] * len(chunk)), table,
-                       table, table, table, table, table, table,
-                       table, table, table, table, table),
+                       table, table, table),
                     binds)
+
+    def _merge_scripts(self, rows):
+        """Fold a window's script rows in with the upsert done server-side.
+
+        COPY cannot carry an ON CONFLICT clause, so the rows go into a staging
+        table by COPY and one INSERT..SELECT does the reconcile.
+
+        The dedup is not cosmetic, and it has to happen here rather than in SQL.
+        A window can hold one script_hash more than once -- two outputs of the
+        same tx, or a re-index -- and a single ON CONFLICT statement may not
+        propose the same key twice. Grouping in SQL is not enough either,
+        because only script_hash is the conflict key: two rows for one hash can
+        disagree about addresses (multisig participants vary by tx) and would
+        still collide. What the old row-at-a-time loop did was apply them in
+        order, so the last row's metadata wins and the heights take the
+        extremes. Folding them the same way in Python says that outright and
+        keeps the statement free to touch each key once.
+        """
+        folded = {}
+        for row in rows:
+            prev = folded.get(row[0])
+            if prev is None:
+                folded[row[0]] = row
+            else:
+                folded[row[0]] = (
+                    prev[0], row[1], row[2], row[3],
+                    _min_height(prev[4], row[4]),
+                    _max_height(prev[5], row[5]))
+        rows = list(folded.values())
+        # No ON COMMIT DROP: a flush can run outside an explicit transaction
+        # (clear_from() does), and in autocommit each statement is its own
+        # transaction, so the table would be dropped before the COPY used it.
+        # A temp table is per-session anyway, so it needs no cleanup of its own.
+        self.conn.execute("""
+            CREATE TEMP TABLE IF NOT EXISTS script_stage
+              (LIKE scripts INCLUDING DEFAULTS)""")
+        self.conn.execute("TRUNCATE script_stage")
+        self.conn.copy_from(
+            "COPY script_stage (script_hash, type, req_sigs, addresses,"
+            " created_height, last_height) FROM STDIN", rows)
+        self.conn.execute("""
+            INSERT INTO scripts (script_hash, type, req_sigs, addresses,
+                                 created_height, last_height)
+            SELECT script_hash, type, req_sigs, addresses,
+                   created_height, last_height
+              FROM script_stage
+            ON CONFLICT(script_hash) DO UPDATE SET
+              created_height = LEAST(scripts.created_height,
+                                     EXCLUDED.created_height),
+              last_height = GREATEST(scripts.last_height,
+                                     EXCLUDED.last_height)""")
 
     def _delete_tx_rows(self, txids):
         """Delete every row derived from these txids, and nothing else.
@@ -1078,12 +1163,21 @@ class DB:
         if self._buf_del:
             self._delete_tx_rows(sorted(self._buf_del))
         rows_by_table = {}
+        script_rows = []
         for table_rows in self._buf.values():
             for table, sql, rows in table_rows:
-                rows_by_table.setdefault(table, (sql, []))[1].extend(rows)
+                if table == "scripts":
+                    script_rows.extend(rows)
+                else:
+                    rows_by_table.setdefault(table, (sql, []))[1].extend(rows)
         for sql, rows in rows_by_table.values():
             for chunk in _chunks(rows):
-                self.conn.executemany(sql, chunk)
+                if sql in COPY_INSTEAD:
+                    self.conn.copy_from(COPY_INSTEAD[sql], chunk)
+                else:
+                    self.conn.executemany(sql, chunk)
+        for chunk in _chunks(script_rows):
+            self._merge_scripts(chunk)
         flags = sorted(self._buf_flags)
         bumps = dict(self._buf_bumps)
         self._buf.clear()
