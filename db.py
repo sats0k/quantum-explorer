@@ -609,6 +609,10 @@ class DB:
         self._buf_del = None    # txids to DELETE, batched into one pass at flush
         self._buf_flags = None  # (txid, n) pairs awaiting _refresh_spent_flags
         self._buf_bumps = None  # meta key -> accumulated delta
+        # One-shot answers to _add_tx's "what did this txid already hold?"
+        # reads, filled by prefetch_txs() for a whole batch. Empty means "ask
+        # the database", which is always correct and always a round trip.
+        self._prefetch = None
         self.conn = _PgConn(dsn)
         try:
             self._open(schema, rebuild, lock_timeout)
@@ -804,6 +808,10 @@ class DB:
         # would be inserted again by the flush at __exit__ -- undoing the
         # truncation the caller just asked for, inside the same transaction.
         self._flush_writes()
+        # A truncation deletes rows a prefetched answer may have described, so
+        # the cache has to go with it. Cheaper to drop the lot than to work out
+        # which txids the deleted range held.
+        self._prefetch = None
         if not self._in_bulk:
             with self.conn:
                 self._clear_from(height)
@@ -1098,6 +1106,68 @@ class DB:
         self._buf_del.add(txid)
         self._buf[txid] = table_rows
 
+    def prefetch_txs(self, txids):
+        """Answer _add_tx's "what did this txid already hold?" reads in bulk.
+
+        Those three reads -- the prevouts a previous version held, the status
+        and coinbase bit, and the supply a confirmed coinbase was counted at --
+        are what decide `released`, `prev_minted` and the n_txs delta, so they
+        cannot be skipped or guessed. Asked one tx at a time they are two round
+        trips per tx, which on this rig was 40% of a block-by-block load.
+
+        Answered here for the whole batch instead: one statement for the
+        prevouts, one for the status, and one more for the supply of just those
+        txids the second statement calls confirmed coinbases. Three round trips
+        per batch, and on a fresh chain none of them return anything -- the
+        table is empty, which is the common case and the one the per-tx form
+        could not notice.
+
+        Each answer is consumed by exactly one add_tx (it is popped, not
+        fetched). That is what makes it safe: a txid added twice in one window
+        -- a re-index -- finds its entry gone and reads the live table, which
+        is what _add_tx already had to do after flushing the window.
+
+        Called only inside a bulk window. Outside one, `add_tx` opens its own
+        transaction per tx and there is nothing to batch.
+        """
+        txids = list(dict.fromkeys(txids))
+        if not txids or not self._in_bulk:
+            return
+        # A read taken now must not miss rows still sitting in the buffer, or it
+        # would answer "this txid holds nothing" about a version the window has
+        # already replaced.
+        self._flush_writes()
+        prefetched = {}
+        for chunk in _chunks(txids):
+            held = {}
+            for txid, prev_txid, prev_vout in self.conn.execute(
+                    "SELECT txid, prev_txid, prev_vout FROM vin "
+                    "WHERE txid = ANY(?::text[]) AND prev_txid IS NOT NULL",
+                    (chunk,)):
+                held.setdefault(txid, []).append((prev_txid, prev_vout))
+            statuses = {}
+            for txid, status, is_coinbase in self.conn.execute(
+                    "SELECT txid, status, is_coinbase FROM txs "
+                    "WHERE txid = ANY(?::text[])", (chunk,)):
+                statuses[txid] = (status, is_coinbase)
+            # Only a confirmed coinbase has counted towards the supply, so this
+            # runs over the handful the previous statement identified rather
+            # than over every txid in the batch.
+            minted_in = [txid for txid, (status, is_coinbase)
+                         in statuses.items()
+                         if is_coinbase and status == "confirmed"]
+            minted = {}
+            for chunk2 in _chunks(minted_in):
+                for txid, total in self.conn.execute(
+                        "SELECT txid, COALESCE(SUM(value)::bigint, 0) FROM vout "
+                        "WHERE txid = ANY(?::text[]) GROUP BY txid", (chunk2,)):
+                    minted[txid] = total
+            for txid in chunk:
+                prefetched[txid] = (held.get(txid, ()),
+                                    statuses.get(txid),
+                                    minted.get(txid, 0))
+        self._prefetch = prefetched
+
     def add_tx(self, t):
         if not self._in_bulk:
             with self.conn:
@@ -1130,24 +1200,32 @@ class DB:
         # ones marked spent.
         held = {(ipt.prev_txid, ipt.prev_vout) for ipt in t.vin
                 if ipt.coinbase is None and ipt.prev_txid}
-        released = [r for r in self.conn.execute(
-            "SELECT DISTINCT prev_txid, prev_vout FROM vin "
-            "WHERE txid=? AND prev_txid IS NOT NULL", (t.txid,))
-            if r not in held]
+        # One prefetched answer, consumed by popping it. Absent means the
+        # caller did not prefetch this batch, or this txid is being added a
+        # second time in one window and has to be read live either way.
+        cached = (self._prefetch or {}).pop(t.txid, None)
+        if cached is not None:
+            held_rows, prev, prev_minted = cached
+        else:
+            held_rows = self.conn.execute(
+                "SELECT DISTINCT prev_txid, prev_vout FROM vin "
+                "WHERE txid=? AND prev_txid IS NOT NULL", (t.txid,)).fetchall()
+        released = [r for r in held_rows if r not in held]
         # What this tx already counted, read before its rows go away: the
         # status that decides whether it was a live tx, and -- for a coinbase
         # -- the supply it was counted at. is_coinbase is read off the stored
         # row rather than off the incoming tx because the figure is defined
         # over what is stored: a txid that somehow arrived with different
         # inputs still has to leave the counter matching the rows.
-        prev = self.conn.execute(
-            "SELECT status, is_coinbase FROM txs WHERE txid=?",
-            (t.txid,)).fetchone()
-        prev_minted = 0
-        if prev is not None and prev[1] and prev[0] == "confirmed":
-            prev_minted = self.conn.execute(
-                "SELECT COALESCE(SUM(value)::bigint, 0) FROM vout WHERE txid=?",
-                (t.txid,)).fetchone()[0]
+        if cached is None:
+            prev = self.conn.execute(
+                "SELECT status, is_coinbase FROM txs WHERE txid=?",
+                (t.txid,)).fetchone()
+            prev_minted = 0
+            if prev is not None and prev[1] and prev[0] == "confirmed":
+                prev_minted = self.conn.execute(
+                    "SELECT COALESCE(SUM(value)::bigint, 0) FROM vout "
+                    "WHERE txid=?", (t.txid,)).fetchone()[0]
         # The one place a row's confirmed-vs-mempool bit is decided. Set from
         # the incoming tx's height and never revisited afterwards, because
         # orphaned rows are deleted rather than flagged, so an output's owner
@@ -1275,6 +1353,9 @@ class DB:
         txids = list(txids)
         if not txids:
             return
+        # Same as clear_from: these rows are about to be deleted, so any
+        # prefetched answer describing them is now wrong.
+        self._prefetch = None
         if not self._in_bulk:
             with self.conn:
                 self._remove_txs(txids)

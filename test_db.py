@@ -3451,3 +3451,73 @@ class BulkWindowHazardTest(DBTestCase):
             for n in (0, 1):
                 self.assertEqual(flag(bulk_db, sig, n), flag(self.db, sig, n),
                                  "%s:%d" % (sig, n))
+
+
+class PrefetchReindexTest(DBTestCase):
+    """The batched read must not answer for a version the window replaced.
+
+    prefetch_txs() replaces the per-tx "what did this txid already hold?" reads
+    with one statement per batch, so each answer is computed once and consumed
+    once. These are the cases where that could be wrong: the same txid added
+    twice inside one window, and a txid prefetched and then re-indexed.
+    """
+
+    def test_reindex_inside_one_prefetched_window(self):
+        with self.db.bulk():
+            self.db.prefetch_txs(["C1"])
+            self.db.add_tx(tx("C1", 1, [("miner", 10 * POKE, 0)], coinbase=True))
+            # Prefetched again inside the same window: the first answer is gone,
+            # so this has to read the version the window just buffered.
+            self.db.prefetch_txs(["C1"])
+            self.db.add_tx(tx("C1", 1, [("miner", 30 * POKE, 0)], coinbase=True))
+        self.assertEqual(self.db.n_txs(), 1)
+        self.assertEqual(self.db.total_coinbase(), 30 * POKE)
+        self.assertMatchesDerived("after a prefetched re-index")
+
+    def test_prefetch_then_reindex_in_a_later_window(self):
+        with self.db.bulk():
+            self.db.add_tx(tx("C1", 1, [("miner", 10 * POKE, 0)], coinbase=True))
+        with self.db.bulk():
+            self.db.prefetch_txs(["C1"])
+            self.db.add_tx(tx("C1", 1, [("miner", 30 * POKE, 0)], coinbase=True))
+        self.assertEqual(self.db.n_txs(), 1)
+        self.assertEqual(self.db.total_coinbase(), 30 * POKE)
+        self.assertMatchesDerived("after a prefetched re-index in a later window")
+
+    def test_prefetch_sees_what_an_earlier_window_committed(self):
+        with self.db.bulk():
+            self.db.add_tx(tx("C1", 1, [("miner", 50 * POKE, 0)], coinbase=True))
+        with self.db.bulk():
+            self.db.add_tx(tx("T1", 1, [("p", 40 * POKE, 0)], [("C1", 0)]))
+        # A prefetch issued after the commit must report the committed input,
+        # which is what makes `released` empty and the input stay spent.
+        with self.db.bulk():
+            self.db.prefetch_txs(["T1"])
+            self.db.add_tx(tx("T1", 1, [("p", 40 * POKE, 0)], [("C1", 0)]))
+        self.assertEqual(self.spent_by("C1"), 1)
+        self.assertMatchesDerived("after re-adding an unchanged tx")
+
+    def test_prefetch_after_truncation_does_not_describe_deleted_rows(self):
+        # Built the way the indexer builds a window: the block and its txs go
+        # in together. An add_block between two windows buffers its n_blocks
+        # bump into a buffer the next window() replaces, so the counter would
+        # read stale -- a separate pre-existing quirk this test must not trip.
+        from indexer import Block
+        daemon = FakeDaemon(2)
+
+        def window(height, with_tx):
+            with self.db.bulk():
+                self.db.add_block(Block(block_at(daemon, height, ["C1", "T1"])))
+                self.db.prefetch_txs(["T1"])
+                self.db.add_tx(tx("C1", height, [("miner", 50 * POKE, 0)],
+                                  coinbase=True))
+                if with_tx:
+                    self.db.add_tx(tx("T1", height, [("p", 40 * POKE, 0)],
+                                      [("C1", 0)]))
+        window(1, True)
+        self.db.clear_from(1)
+        # The prefetch above described rows the truncation deleted. Re-adding has
+        # to see no previous version, not the deleted one.
+        window(2, True)
+        self.assertEqual(self.spent_by("C1"), 1)
+        self.assertMatchesDerived("after re-adding a truncated tx")

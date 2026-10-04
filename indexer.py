@@ -266,6 +266,14 @@ class Indexer:
                         blk = Block(j)
                         for i, txid in enumerate(blk.txids):
                             txlist.append((h, i, txid))
+                    # Ask once, for every txid in the window, what each of them
+                    # already held. Inside the block, add_tx makes two round
+                    # trips per tx to find out -- and on a chain being indexed
+                    # for the first time the answer is always "nothing", which
+                    # is exactly the case two round trips per tx cannot notice.
+                    # Done before the window's first add_tx, so the reads see
+                    # the same rows they would have seen individually.
+                    self.db.prefetch_txs(txid for _, _, txid in txlist)
                     for i in range(0, len(txlist), 500):
                         chunk = txlist[i:i + 500]
                         pending = chunk
@@ -349,6 +357,7 @@ class Indexer:
                     if r[1] != "orphaned")
             pending = [txid for txid in txids if txid not in known]
         added = 0
+        self.db.prefetch_txs(pending)
         fetch = [("getrawtransaction", (txid, 1)) for txid in pending]
         # Batch in chunks like the chain indexer (one HTTP round-trip per N
         # txs instead of one per tx). If a batch fails (e.g. a tx confirmed
