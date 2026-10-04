@@ -3187,7 +3187,9 @@ class BulkWindowHazardTest(DBTestCase):
       - a reorg truncating the chain from inside the window;
       - a mempool eviction removing rows added in this same window;
       - a read of the table or of a counter before the window closes;
-      - the window raising, which must leave nothing behind.
+      - the window raising, which must leave nothing behind;
+      - a write arriving after the window closed, which must not be mistaken
+        for one still buffered.
 
     A wrong answer here is silent -- a doubled balance, a supply that drifts,
     rows resurrected by a truncation -- so each case is checked against the
@@ -3289,6 +3291,41 @@ class BulkWindowHazardTest(DBTestCase):
             self.block(1)
             self.assertEqual(self.db.n_blocks(), 1)
         self.assertEqual(self.db.n_blocks(), 1)
+
+    def test_a_write_after_the_window_closed_is_not_still_buffered(self):
+        # _flush_writes restores the buffers when it runs from the middle of a
+        # window, so that a flush does not silently end the window. The flush at
+        # __exit__ is the same call with the window closing behind it, so the
+        # buffers must come down there or every write after it is buffered into
+        # nothing: the block row and its n_blocks bump, a tx's rows, the spent
+        # flags. Silent, and worse than a crash -- the indexer would report a
+        # window that landed while the table disagreed.
+        for h in (1, 2):
+            with self.db.bulk():
+                self.block(h)
+                self.db.add_tx(tx("T%d" % h, h, [("a", h * POKE, 0)],
+                                  [("prev", 0)]))
+        self.assertIsNone(self.db._buf, "buffers left standing after the window")
+        self.assertIsNone(self.db._buf_bumps)
+
+        # No window open here: this is its own transaction. T3 spends an output
+        # of T2, so if its flag refresh were buffered instead of run, T2's
+        # output would still read unspent -- the one symptom here that is not
+        # also a missing row.
+        self.block(3)
+        self.db.add_tx(tx("T3", 3, [("a", 3 * POKE, 0)], [("T2", 0)]))
+
+        self.assertEqual(self.db.conn.execute(
+            "SELECT count(*) FROM blocks").fetchone()[0], 3)
+        for table in ("txs", "vin", "vout", "addr_out"):
+            self.assertEqual(
+                self.db.conn.execute(
+                    "SELECT count(*) FROM %s WHERE txid='T3'" % table
+                ).fetchone()[0], 1, table)
+        self.assertEqual(self.db.n_blocks(), 3)
+        self.assertEqual(self.db.conn.execute(
+            "SELECT spent_by FROM vout WHERE txid='T2' AND n=0").fetchone()[0], 1)
+        self.assertMatchesDerived("after a write outside any window")
 
     def test_a_reorg_from_inside_the_window_truncates_what_the_window_wrote(self):
         # The dangerous one. A reorg calls clear_from while the window still

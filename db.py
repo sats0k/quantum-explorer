@@ -233,6 +233,14 @@ class _Bulk:
             # with no rows in it and counts that match nothing.
             try:
                 db._flush_writes()
+                # And take the window down for good, which _flush_writes cannot
+                # do: it restores the buffers in its finally block so that a flush
+                # from the MIDDLE of a window keeps buffering afterwards. Here the
+                # window is closing, so leaving them standing would tell the next
+                # writer outside a window that one is open -- and its rows and its
+                # counter deltas would go into buffers that nothing will ever
+                # flush. The empty buffers hold nothing, so dropping them is free.
+                db._discard_writes()
                 db.conn.commit()
             except BaseException:
                 # Either step can fail while the connection stays usable -- a
