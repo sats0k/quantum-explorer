@@ -219,14 +219,20 @@ address rather than ask twice.
   writes a row only when the mask it computed differs from the one already held.
   Without that, indexing from genesis rewrote every unspent output of every
   transaction to the value it already had -- a new row version and two index
-  entries each, for no change. The recompute is evaluated per row against the
-  post-delete `vin`, and the `WHERE` arm repeats the `CASE` rather than sharing
-  it, because a subquery in `SET` sees the pre-`UPDATE` snapshot; skipping a
-  write has to compare against what the row actually holds.
-- Sync is now insert-bound. What remains of a window is the buffered
-  `INSERT ... ON CONFLICT` statements at the flush, already batched. `COPY`
-  would cut those further, but it cannot express the upserts or the deferred
-  flag recompute, so it is a larger change than a query-level one.
+  entries each, for no change. The masks come from one grouped probe per pair,
+  asked against the post-delete `vin`: `MAX` over the chunk's spenders, with a
+  `LEFT JOIN` so a pair nothing spends yields zero rather than vanishing. That
+  last part is what lets a mask move backwards when an eviction takes away the
+  only spender an output had. `FLAG_PAIR_CHUNK` is large because the cost of the
+  grouped form is set by how many statements a window takes, not how many rows
+  they carry -- it scans the target table once per statement -- so the chunk
+  sizes to stay under the protocol's bind limit rather than to bound rows.
+- The buffered inserts go in by `COPY` where the statement has no `ON CONFLICT`,
+  which skips per-row parameter binding and the extended query protocol. `COPY`
+  cannot carry an upsert, so `scripts` stages through a temp table and folds in
+  with one `INSERT ... ON CONFLICT`; that dedup has to happen in Python, because
+  only `script_hash` is the conflict key and two rows for one hash can disagree
+  about `addresses`, which a SQL `GROUP BY` on the full row would not fold.
 - **There are no migrations.** The schema is never altered in place. Changing
   it means a shape change is detected on the next indexer start, the tables are
   dropped, and the chain is re-synced from genesis. What that buys is the
