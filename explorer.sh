@@ -13,7 +13,11 @@ DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # argument is the DSN rather than a path. Override with DB= if your database
 # needs credentials, a socket directory or a non-default port:
 #   DB='postgresql://explorer@/explorer?host=/run/postgresql' ./explorer.sh start
-DB="${DB:-dbname=explorer}"
+# user= is not optional here: without it libpq connects as the OS account, and
+# since PostgreSQL 15 that account no longer owns `public` in a database
+# belonging to someone else, so CREATE TABLE is refused with InsufficientPrivilege
+# on schema public. The named user must own the database.
+DB="${DB:-dbname=explorer user=user}"
 RPCUSER="${RPCUSER:-user}"
 RPCPASSWORD="${RPCPASSWORD:-pass}"
 RPCHOST="${RPCHOST:-127.0.0.1}"
