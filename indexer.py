@@ -193,27 +193,43 @@ class Indexer:
         # work (never inside a bulk transaction) and exits cleanly.
         self._stop = threading.Event()
         # Ask for decoded transactions inside the block reply. Dropped to 1 the
-        # first time a daemon refuses the argument, and remembered, so the
-        # fallback is paid for once rather than once per window.
+        # first time a daemon turns out not to honour the argument, and
+        # remembered, so the fallback is paid for once rather than once per
+        # window.
         self._verbosity = 2
 
     def get_blocks(self, hashes):
         """Blocks by hash, with their transactions already decoded.
 
-        A daemon without the verbosity argument answers with bare txids (or
-        refuses the extra parameter outright); both are handled here so the
-        caller's per-tx fallback only has to recognise a txid in a `tx` slot.
+        Two ways a daemon can not oblige, both permanent:
+
+        - it rejects the second argument outright (RPCError), or
+        - it accepts the call and answers with bare txids, having ignored the
+          argument. Only the reply can tell us this, and it must be acted on:
+          asking again next window would get the same bare txids, and every
+          window would pay for a per-tx fallback it had already learned is
+          unnecessary. So the shapes are checked on every window, not just the
+          first, and `_verbosity` is latched down as soon as txids come back.
+
+        A window holding no transactions at all proves nothing either way, so
+        the verbosity is left alone rather than given up on that evidence.
         """
+        if self._verbosity == 1:
+            return self.rpc.batch([("getblock", (bh,)) for bh in hashes])
         try:
-            return self.rpc.batch(
+            blocks = self.rpc.batch(
                 [("getblock", (bh, self._verbosity)) for bh in hashes])
         except RPCError:
-            if self._verbosity == 1:
-                raise
             self._verbosity = 1
-            print("daemon has no getblock verbosity argument, falling back "
-                  "to one lookup per tx")
+            print("daemon rejects the getblock verbosity argument, falling "
+                  "back to one lookup per tx")
             return self.rpc.batch([("getblock", (bh,)) for bh in hashes])
+        slots = [t for j in blocks for t in j.get("tx", [])]
+        if slots and not any(isinstance(t, dict) for t in slots):
+            self._verbosity = 1
+            print("daemon ignores the getblock verbosity argument (block "
+                  "replies carry txids), falling back to one lookup per tx")
+        return blocks
 
     def store_stub(self, txid, height, tx_index, exhausted=False):
         """Write the placeholder for a tx we will never detail, and count it."""

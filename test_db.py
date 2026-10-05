@@ -2505,8 +2505,33 @@ class BlockVerbosityTest(DBTestCase):
     why the genesis coinbase used to be stored without inputs or outputs.
     """
 
-    def daemon(self, decoded):
-        d = BlockDaemon(2, {1: ["CB", "A"], 2: ["B"]})
+    def daemon(self, decoded, tip=2, txids=None):
+        if txids is None:
+            txids = {1: ["CB", "A"], 2: ["B"]}
+        d = BlockDaemon(tip, txids)
+        d.decoded_blocks = decoded
+        self.indexer.rpc = d
+        return d
+
+    class Recording(BlockDaemon):
+        """A BlockDaemon that notes every verbosity it was asked for.
+
+        One entry per getblock call, so a window of 100 blocks asking for
+        verbosity 2 records 100.
+        """
+
+        def __init__(self, *a, **kw):
+            super().__init__(*a, **kw)
+            self.asked = []
+
+        def getblock(self, blockhash, verbosity=1):
+            self.asked.append(verbosity)
+            return BlockDaemon.getblock(self, blockhash, verbosity)
+
+    def multi_window_daemon(self, decoded):
+        """400 blocks of one tx each, four windows of 100, for watching whether
+        a fallback is remembered across windows rather than re-paid per one."""
+        d = self.Recording(400, {i: ["T%03d" % i] for i in range(1, 401)})
         d.decoded_blocks = decoded
         self.indexer.rpc = d
         return d
@@ -2548,9 +2573,7 @@ class BlockVerbosityTest(DBTestCase):
         self.assertEqual(self.db.query(
             "SELECT COUNT(*) FROM addr_out WHERE txid='CB'")[0][0], 1)
 
-    def test_a_daemon_without_verbosity_still_works(self):
-        # An older daemon rejects the second argument, so the indexer has to
-        # fall back rather than fail the window.
+    def test_a_daemon_returning_txids_still_works(self):
         d = self.daemon(False)
         self.indexer.sync_blocks()
         self.assertEqual(self.db.tip_height(), 2)
@@ -2569,6 +2592,63 @@ class BlockVerbosityTest(DBTestCase):
         self.assertEqual(self.db.tip_height(), 2)
         self.assertEqual(self.db.query(
             "SELECT COUNT(*) FROM txs WHERE status='confirmed'")[0][0], 3)
+        self.assertEqual(self.indexer._verbosity, 1)
+
+    def test_a_rejecting_daemon_is_not_asked_verbosity_again(self):
+        d = self.multi_window_daemon(False)
+        d.decoded_blocks = True
+        # It rejects the argument but would have honoured it.
+        base = BlockDaemon.getblock
+
+        def getblock(self, blockhash, verbosity=1):
+            self.asked.append(verbosity)
+            if verbosity != 1:
+                raise RPCError("getblock takes 1 argument")
+            return base(self, blockhash, verbosity)
+
+        d.getblock = getblock.__get__(d, type(d))
+        self.indexer.sync_blocks(batch_size=100)
+        self.assertEqual(self.indexer._verbosity, 1)
+        self.assertEqual(d.asked.count(2), 1,
+                         "the argument was retried after the refusal cleared")
+        self.assertEqual(self.db.tip_height(), 400)
+
+    def test_a_daemon_that_ignores_the_argument_is_not_asked_again(self):
+        # The case a refusal cannot catch: the daemon accepts verbosity=2 and
+        # answers with bare txids anyway. Nothing errors, so only the shape of
+        # the reply reveals it -- and if the indexer does not act on that, every
+        # later window asks again and pays for a per-tx fallback it already
+        # knows is pointless.
+        d = self.multi_window_daemon(False)
+        self.indexer.sync_blocks(batch_size=100)
+        self.assertEqual(self.indexer._verbosity, 1,
+                         "txids in the reply did not latch the verbosity down")
+        self.assertEqual(d.asked.count(2), 100,
+                         "only the first window may ask for verbosity 2")
+        # Correct but slow: the fallback still indexed every transaction.
+        self.assertEqual(self.db.tip_height(), 400)
+        self.assertEqual(len(d.fetched), 400)   # genesis holds none
+
+    def test_a_daemon_that_honours_the_argument_keeps_asking(self):
+        # The other half of the rule: the check must not latch down a daemon
+        # that is working, or the fast path is given up after one window.
+        d = self.multi_window_daemon(True)
+        self.indexer.sync_blocks(batch_size=100)
+        self.assertEqual(self.indexer._verbosity, 2)
+        # 401 blocks: genesis has no tx, so its reply proves nothing, but it
+        # is still asked for.
+        self.assertEqual(d.asked.count(2), 401, "every block, every window")
+        self.assertEqual(d.asked.count(1), 0)
+        self.assertEqual(d.fetched, [])
+
+    def test_a_window_with_no_transactions_does_not_give_up_on_verbosity(self):
+        # Nothing in the reply to judge the daemon by, so it has to be taken on
+        # faith until a window actually carries a transaction.
+        d = self.daemon(True, tip=2, txids={})
+        d.decoded_blocks = False
+        self.indexer.sync_blocks()
+        self.assertEqual(self.indexer._verbosity, 2)
+        self.assertEqual(self.db.tip_height(), 2)
 
 
 class TxRetrievalDialogTest(DBTestCase):
