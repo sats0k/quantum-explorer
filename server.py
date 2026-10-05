@@ -25,6 +25,7 @@ of the money (a multi-address vout credits no single address).
 
 import argparse
 import contextlib
+import ipaddress
 import json
 import os
 import queue
@@ -32,6 +33,7 @@ import signal
 import socket
 import sqlite3
 import sys
+import traceback
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse
 
@@ -61,6 +63,42 @@ def poke(v):
     return "%s%d.%08d" % ("-" if neg else "", whole, frac)
 
 
+def _is_height(ref):
+    """True if a URL path segment is a block height rather than a hash.
+
+    ASCII digits only: str.isdigit() also accepts the Unicode digit forms
+    ('²' and friends), and int() would then take a different path than the one
+    this is deciding about.
+    """
+    return ref.isascii() and ref.isdigit()
+
+
+def url_for(host, port):
+    """A URL for `host`:`port` that can actually be opened.
+
+    An IPv6 literal contains colons, which a URL has to bracket, so the
+    unbracketed `http://::1:8080/` that used to be printed at startup was not an
+    address anyone could paste into a browser.
+    """
+    return "http://%s:%d/" % ("[%s]" % host if ":" in host else host, port)
+
+
+def reachable_off_machine(host):
+    """Whether binding `host` lets anything but this machine in.
+
+    Anything not positively a loopback address counts as reachable, because the
+    cost of guessing wrong here is an unnoticed public port and the cost of
+    over-warning is one line in a log. A hostname resolves to something, but
+    which something is not ours to assume, so it is treated as reachable.
+    """
+    if host == "localhost":
+        return False
+    try:
+        return not ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return True
+
+
 def with_hex(balances):
     """Add the *_hex display form to a balance dict, in place."""
     for key in ("value_received", "value_spent", "balance"):
@@ -73,6 +111,29 @@ def with_hex(balances):
 # queries are in flight at once -- and an indefinite wait there is strictly
 # worse than a bounded one.
 POOL_TIMEOUT = 5.0
+
+# An address's tx history is two halves of one set: the txs that paid it, and
+# the txs that spent what it was paid. Written once here because the list and
+# the count below have to agree on it exactly -- they are the same question
+# asked twice, once bounded and once not.
+#
+# Orphaned txs are excluded: the txs list is current history, and no other
+# endpoint counts an orphan anywhere. Reorgs sever an orphan's vin rows
+# (db._clear_from), so the join could not see one on a real database -- but the
+# filter states the contract rather than leaning on that data-layer detail
+# alone, and an orphan test that leaves the rows in place is exactly the case
+# where leaning on it would be wrong.
+#
+# The txs join is the expensive half and stays. Dropping it was measured as
+# worth ~4s on the 510k-output address, which is not a good trade for weakening
+# the guarantee.
+ADDR_TXS_UNION = (
+    "SELECT txid FROM addr_out WHERE address=?"
+    " UNION"
+    " SELECT i.txid FROM vin i"
+    " JOIN txs t ON t.txid = i.txid"
+    " JOIN addr_out a ON a.txid = i.prev_txid AND a.n = i.prev_vout"
+    " WHERE a.address=? AND t.status != 'orphaned'")
 
 
 class DBPool:
@@ -170,10 +231,19 @@ class Explorer:
         }
 
     def block(self, ref):
+        # `ref` is a URL path segment, so it arrives as a str that is usually a
+        # hash and sometimes a height. One statement cannot ask for both here:
+        # blocks.height is an integer column, and comparing it against a
+        # 64-character hex hash relies on the affinity rules to match nothing
+        # rather than to be a lookup -- which also costs the planner an OR it
+        # can only satisfy by probing both indexes on every call. So the
+        # reference is classified first, and the two lookups ask disjoint
+        # questions -- a 64-character hex hash cannot also be a height.
+        col, val = ("height", int(ref)) if _is_height(ref) else ("hash", ref)
         rows = self.db.query(
             "SELECT height, hash, version, merkleroot, time, nonce, bits, "
             "difficulty, size, prev_hash, next_hash FROM blocks "
-            "WHERE hash=? OR height=?", (ref, ref))
+            "WHERE " + col + "=?", (val,))
         if not rows:
             return None
         block = dict(zip(BLOCK_COLS, rows[0]))
@@ -256,38 +326,34 @@ class Explorer:
             "SELECT txid, n, value, type, spent_by FROM addr_out "
             "WHERE address=? ORDER BY txid, n LIMIT ?",
             (addr, self.ADDR_OUT_LIMIT))
-        # Every transaction spending one of this address's outputs, in a single
-        # enumeration, for the spending half of the txs list below. The per-output
-        # spent_confirmed flag no longer comes from here: it is spent_by's
-        # confirmed bit, read off the row we already fetched, so the two views of
-        # an output's status are no longer derived by walking the address twice
-        # for two purposes.
+        # Transactions touching the address from either side: the ones that paid
+        # it and the ones that spent what it was paid, which is what
+        # ADDR_TXS_UNION holds. The list used to be built from addr_out alone, so
+        # an address whose every received coin was later spent ended its tx
+        # history at the last payout -- the transactions that moved those coins
+        # back out were invisible, and n_txs understated the participation.
         #
-        # Orphaned txs are excluded: the txs list is current history, and no
-        # other endpoint counts an orphan anywhere. Reorgs sever an orphan's vin
-        # rows (db._clear_from), so the join could not see one on a real
-        # database -- but the filter states the contract rather than leaning on
-        # that data-layer detail alone, and an orphan test that leaves the rows
-        # in place is exactly the case where leaning on it would be wrong.
-        # Dropping this join was measured as worth ~4s on the 510k-output
-        # address and is not worth weakening the guarantee for.
-        spend_txids = set(r[0] for r in self.db.query(
-            "SELECT i.txid FROM vin i"
-            " JOIN txs t ON t.txid = i.txid"
-            " JOIN addr_out a ON a.txid = i.prev_txid AND a.n = i.prev_vout"
-            " WHERE a.address=? AND t.status != 'orphaned'", (addr,)))
-        # Transactions touching the address from either side: the receiving ones
-        # straight from addr_out (the primary key streams them in txid order),
-        # unioned with the spenders above, deduped and sorted in Python. The
-        # list used to be built from addr_out alone, so an address whose every
-        # received coin was later spent ended its tx history at the last payout
-        # -- the transactions that moved those coins back out were invisible,
-        # and n_txs understated the participation.
-        involved = sorted(set(r[0] for r in self.db.query(
-            "SELECT DISTINCT txid FROM addr_out WHERE address=?", (addr,)))
-            | spend_txids)
-        n_txs = len(involved)
-        txs = involved[:self.ADDR_OUT_LIMIT]
+        # Both halves used to be assembled here in Python, which made this the
+        # one endpoint whose cost the caller chose: the spender enumeration had
+        # no row cap, n_txs was len() of the union, and the union was then
+        # sorted. So a high-activity address put its entire tx history into the
+        # request thread's heap -- one statement's worth of rows, plus a sort
+        # over them -- before being sliced back down to ADDR_OUT_LIMIT entries
+        # for the response. The outputs half above was capped; this one was not,
+        # and the 510k-output address in the tests is the case that proves it.
+        #
+        # Now the cap is a LIMIT in the statement, so the database stops when it
+        # has enough and this process never sees the rest. n_txs stays exact --
+        # txs_truncated is judged against it, and reporting a bounded number as
+        # the real one would be a different lie -- but it is counted where the
+        # rows already are, so the set behind it is the database's memory
+        # concern rather than ours.
+        txs = [r[0] for r in self.db.query(
+            ADDR_TXS_UNION + " ORDER BY txid LIMIT ?",
+            (addr, addr, self.ADDR_OUT_LIMIT))]
+        n_txs = self.db.query(
+            "SELECT COUNT(*) FROM (%s) u" % ADDR_TXS_UNION,
+            (addr, addr))[0][0]
         return {
             "address": addr,
             "confirmed": with_hex(bal["confirmed"]),
@@ -454,26 +520,70 @@ class Handler(BaseHTTPRequestHandler):
             # simultaneous long queries. Say so instead of waiting forever.
             self._send(503, {"error": "busy"})
             return
-        except sqlite3.Error as e:
-            self._send(500, {"error": str(e)})
+        except sqlite3.Error:
+            # A database exception message is written for whoever has to fix the
+            # query, not for whoever made the request: it names the table and
+            # column, quotes the failing statement, and can hand over the
+            # schema around it -- enough to reconstruct the index's shape, and
+            # to tell a probe which table and column it should be asking about
+            # instead. Returning str(e) published all of that to any client that
+            # could reach the port.
+            #
+            # So the detail goes to the log, where the operator reading
+            # server_web.log gets the traceback, and the client gets a fixed
+            # string it learns nothing from. The path is logged with it because
+            # a bare sqlite3 traceback does not say which request caused it.
+            traceback.print_exc()
+            print("%s %s -> 500 (database error)"
+                  % (self.client_address[0], path), flush=True)
+            self._send(500, {"error": "internal server error"})
             return
         self._send(*res)
 
 
-def main():
+def argument_parser():
+    """The command line, in one place so the defaults can be asserted on.
+
+    `main()` used to build this inline, which left the bind address -- the one
+    setting that decides whether the explorer is reachable from the network --
+    with no way to read it back without starting a server.
+    """
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("db", nargs="?", default="explorer.db")
-    p.add_argument("--host", default="::")
+    p.add_argument("--host", default="127.0.0.1",
+                   help="address to bind; loopback by default, so exposing "
+                        "this is something you ask for rather than something "
+                        "that happens")
     p.add_argument("--port", type=int, default=8080)
-    args = p.parse_args()
+    return p
 
-    DB.initialize(args.db)   # create/migrate the schema exactly once
-    Handler.pool = DBPool(args.db)   # and warm the read connections
+
+def main():
+    args = argument_parser().parse_args()
+
     server_cls = DualStackHTTPServer
     if ":" not in args.host:  # literal IPv4 address -> plain IPv4 bind
         server_cls = ThreadingHTTPServer
+    # Bind BEFORE the schema work, and treat that work as optional. On a
+    # database being built from scratch it is creating tables and holding the
+    # write lock for as long as that takes, and this process used to stand
+    # still waiting for that lock before opening a socket -- so a cold start
+    # answered the browser with connection-refused until someone ran it a
+    # second time. Reading needs no exclusive lock and no DDL, so there is
+    # nothing here that has to finish before the port answers.
     httpd = server_cls((args.host, args.port), Handler)
-    print("explorer running on http://%s:%d/" % (args.host, args.port))
+    print("explorer running on %s" % url_for(args.host, args.port))
+    if reachable_off_machine(args.host):
+        print("warning: bound to %s, so this port answers from outside this "
+              "machine and the explorer is served over plain HTTP with no "
+              "authentication -- bind loopback and let a TLS-terminating proxy "
+              "be the public face" % args.host)
+
+    try:
+        DB.initialize(args.db)   # create/migrate the schema exactly once
+    except Exception as e:       # already; a failure here must not stop the
+        print("warning: schema init failed (%s); serving anyway" % e)
+    Handler.pool = DBPool(args.db)   # and warm the read connections
 
     def _stop(signum, frame):
         raise KeyboardInterrupt

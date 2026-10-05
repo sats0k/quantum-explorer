@@ -322,6 +322,10 @@ class DB:
     def __init__(self, path, schema=True, check_same_thread=True,
                  busy_timeout=None):
         self._in_bulk = False
+        # One-shot answers to _add_tx's "what did this txid already hold?"
+        # reads, filled by prefetch_txs() for a whole batch. None means "ask the
+        # database", which is always correct and always a statement per tx.
+        self._prefetch = None
         self.conn = sqlite3.connect(path, check_same_thread=check_same_thread)
         try:
             self._open(schema, busy_timeout)
@@ -621,6 +625,10 @@ class DB:
 
     def clear_from(self, height):
         """Truncate the chain at <height> (reorg support)."""
+        # A truncation deletes rows that a prefetched answer may have described,
+        # so the cache has to go with it. Cheaper to drop the lot than to work
+        # out which txids the deleted range held.
+        self._prefetch = None
         if not self._in_bulk:
             with self.conn:
                 self._clear_from(height)
@@ -660,6 +668,8 @@ class DB:
         statements.
         """
         outputs = list(dict.fromkeys(tuple(o) for o in outputs))
+        if not outputs:
+            return
         per = max(1, SQL_VAR_CHUNK // 2)       # two binds per (txid, n) pair
         for i in range(0, len(outputs), per):
             chunk = outputs[i:i + per]
@@ -800,6 +810,69 @@ class DB:
              b.bits, b.difficulty, b.size, b.prev_hash, b.next_hash))
         self._bump(N_BLOCKS_KEY, 1 if new_height else 0)
 
+    def prefetch_txs(self, txids):
+        """Answer _add_tx's "what did this txid already hold?" reads in bulk.
+
+        Those three reads -- the prevouts a previous version held, the status
+        and coinbase bit, and the supply a confirmed coinbase was counted at --
+        are what decide `released`, `prev_minted` and the n_txs delta, so they
+        cannot be skipped or guessed. Asked one tx at a time they are two
+        statements per tx, and on a chain being indexed for the first time the
+        answer is always "nothing", which is exactly the case the per-tx form
+        cannot notice.
+
+        Answered here for the whole batch instead: one statement for the
+        prevouts, one for the status, and one more for the supply of just those
+        txids the second statement calls confirmed coinbases. Three statements
+        per batch, and on a fresh chain none of them return anything.
+
+        Each answer is consumed by exactly one add_tx (it is popped, not
+        fetched). That is what makes it safe: a txid added twice in one window
+        -- a re-index -- finds its entry gone and reads the live table, which
+        is what _add_tx already had to do.
+
+        Called only inside a bulk window. Outside one, `add_tx` opens its own
+        transaction per tx and there is nothing to batch.
+        """
+        txids = list(dict.fromkeys(txids))
+        if not txids or not self._in_bulk:
+            return
+        # No flush is needed before these reads, unlike a backend that buffers
+        # a window's rows in the client: here every write the window has made is
+        # already on the table inside this same transaction, so a read cannot
+        # miss a version the window has replaced.
+        prefetched = {}
+        for chunk in _chunks(txids):
+            held = {}
+            for txid, prev_txid, prev_vout in self.conn.execute(
+                    "SELECT txid, prev_txid, prev_vout FROM vin "
+                    "WHERE txid IN (%s) AND prev_txid IS NOT NULL"
+                    % ",".join("?" * len(chunk)), chunk):
+                held.setdefault(txid, []).append((prev_txid, prev_vout))
+            statuses = {}
+            for txid, status, is_coinbase in self.conn.execute(
+                    "SELECT txid, status, is_coinbase FROM txs "
+                    "WHERE txid IN (%s)" % ",".join("?" * len(chunk)), chunk):
+                statuses[txid] = (status, is_coinbase)
+            # Only a confirmed coinbase has counted towards the supply, so this
+            # runs over the handful the previous statement identified rather
+            # than over every txid in the batch.
+            minted_in = [txid for txid, (status, is_coinbase)
+                         in statuses.items()
+                         if is_coinbase and status == "confirmed"]
+            minted = {}
+            for chunk2 in _chunks(minted_in):
+                for txid, total in self.conn.execute(
+                        "SELECT txid, COALESCE(SUM(value), 0) FROM vout "
+                        "WHERE txid IN (%s) GROUP BY txid"
+                        % ",".join("?" * len(chunk2)), chunk2):
+                    minted[txid] = total
+            for txid in chunk:
+                prefetched[txid] = (held.get(txid, ()),
+                                    statuses.get(txid),
+                                    minted.get(txid, 0))
+        self._prefetch = prefetched
+
     def add_tx(self, t):
         if not self._in_bulk:
             with self.conn:
@@ -814,24 +887,32 @@ class DB:
         # ones marked spent.
         held = {(ipt.prev_txid, ipt.prev_vout) for ipt in t.vin
                 if ipt.coinbase is None and ipt.prev_txid}
-        released = [r for r in self.conn.execute(
-            "SELECT DISTINCT prev_txid, prev_vout FROM vin "
-            "WHERE txid=? AND prev_txid IS NOT NULL", (t.txid,))
-            if r not in held]
+        # One prefetched answer, consumed by popping it. Absent means the caller
+        # did not prefetch this batch, or this txid is being added a second time
+        # in one window and has to be read live either way.
+        cached = (self._prefetch or {}).pop(t.txid, None)
+        if cached is not None:
+            held_rows, prev, prev_minted = cached
+        else:
+            held_rows = self.conn.execute(
+                "SELECT DISTINCT prev_txid, prev_vout FROM vin "
+                "WHERE txid=? AND prev_txid IS NOT NULL", (t.txid,)).fetchall()
+        released = [r for r in held_rows if r not in held]
         # What this tx already counted, read before its rows go away: the
         # status that decides whether it was a live tx, and -- for a coinbase
         # -- the supply it was counted at. is_coinbase is read off the stored
         # row rather than off the incoming tx because the figure is defined
         # over what is stored: a txid that somehow arrived with different
         # inputs still has to leave the counter matching the rows.
-        prev = self.conn.execute(
-            "SELECT status, is_coinbase FROM txs WHERE txid=?",
-            (t.txid,)).fetchone()
-        prev_minted = 0
-        if prev is not None and prev[1] and prev[0] == "confirmed":
-            prev_minted = self.conn.execute(
-                "SELECT COALESCE(SUM(value),0) FROM vout WHERE txid=?",
-                (t.txid,)).fetchone()[0]
+        if cached is None:
+            prev = self.conn.execute(
+                "SELECT status, is_coinbase FROM txs WHERE txid=?",
+                (t.txid,)).fetchone()
+            prev_minted = 0
+            if prev is not None and prev[1] and prev[0] == "confirmed":
+                prev_minted = self.conn.execute(
+                    "SELECT COALESCE(SUM(value),0) FROM vout WHERE txid=?",
+                    (t.txid,)).fetchone()[0]
         self._delete_tx_rows([t.txid])
         # The one place a row's confirmed-vs-mempool bit is decided. Set from
         # the incoming tx's height and never revisited afterwards, because
@@ -919,7 +1000,8 @@ class DB:
         # previous one had counted. height IS NULL while unconfirmed, so a
         # mempool coinbase adds nothing until it is indexed into a block.
         self._bump(COINBASE_TOTAL_KEY,
-                   (sum(ot.value for ot in t.vout) if t.height is not None else 0)
+                   (sum(ot.value for ot in t.vout)
+                    if t.is_coinbase and t.height is not None else 0)
                    - prev_minted)
         # n_txs counts non-orphaned rows: a re-index of a live tx replaces it
         # and nets to zero, while an orphan returning to the chain or the
@@ -960,6 +1042,12 @@ class DB:
             self._remove_txs(txids)
 
     def _remove_txs(self, txids):
+        # These rows are about to be deleted, so any prefetched answer
+        # describing them is now wrong. Cheaper to drop the lot than to work out
+        # which txids the deleted set held. Note this is not _refresh_spent_flags:
+        # that runs after every add_tx to settle spent flags, so invalidating
+        # there would throw the cache away before it had answered anything.
+        self._prefetch = None
         # Chunked because a mempool eviction can be longer than SQLite's bind
         # cap, and one statement cannot hold every stale id. The chunks share
         # the single transaction remove_txs() opened, so the eviction is still

@@ -13,7 +13,12 @@ RPCUSER="${RPCUSER:-user}"
 RPCPASSWORD="${RPCPASSWORD:-pass}"
 RPCHOST="${RPCHOST:-127.0.0.1}"
 RPCPORT="${RPCPORT:-9554}"
-WEBHOST="${WEBHOST:-::}"
+# Loopback, not every interface: the nginx setup in README.md proxies to
+# 127.0.0.1:8080, so the Python server is only ever meant to be reached from
+# this machine; binding "::" would also open 8080 to the network directly, which
+# serves the whole explorer over plain HTTP and steps around nginx and its TLS.
+# Set WEBHOST=:: (or =0.0.0.0) to expose it without a proxy on purpose.
+WEBHOST="${WEBHOST:-127.0.0.1}"
 WEBPORT="${WEBPORT:-8080}"
 
 PIDDIR="$DIR/.run"
@@ -137,7 +142,23 @@ start_all() {
     --host "$WEBHOST" --port "$WEBPORT" \
     >> "$DIR/server_web.log" 2>&1 &
   echo $! > "$WEB_PID"
-  echo "web:      pid $! -> log $DIR/server_web.log (http://${WEBHOST}:${WEBPORT}/)"
+  echo "web:      pid $! -> log $DIR/server_web.log ($(web_url))"
+  case "$WEBHOST" in
+    # Anything but a loopback literal is on the network, and worth saying so
+    # here as well as in the server's own log: this is the line an operator
+    # reads when deciding whether the explorer is public.
+    127.*|::1|localhost) ;;
+    *) echo "warning: WEBHOST=$WEBHOST is not loopback, so port $WEBPORT is open to the network" ;;
+  esac
+}
+
+# An IPv6 literal has to be bracketed to sit in a URL, or the port cannot be
+# told from the address. Only called after WEBHOST/WEBPORT are set.
+web_url() {
+  case "$WEBHOST" in
+    *:*) echo "http://[$WEBHOST]:$WEBPORT/" ;;
+    *)   echo "http://$WEBHOST:$WEBPORT/" ;;
+  esac
 }
 
 cmd="${1:-start}"

@@ -63,7 +63,7 @@ class FakeDaemon:
             raise RPCError("Block height out of range")
         return self.hash_at(height)
 
-    def getblock(self, blockhash):
+    def getblock(self, blockhash, verbosity=1):
         height = int(blockhash[1:])
         return {"height": height, "hash": self.hash_at(height), "tx": [],
                 "previousblockhash":
@@ -102,17 +102,51 @@ def block_at(daemon, height, txids=()):
                 daemon.hash_at(height - 1) if height else None}
 
 
+def daemon_tx(txid, coinbase=False):
+    """A decoded transaction, as it appears in a verbosity=2 block reply and
+    as getrawtransaction(verbose=True) returns it."""
+    vin = ([{"coinbase": "00deadbeef", "sequence": 0xFFFFFFFF}] if coinbase
+           else [{"txid": "prev", "vout": 0, "sequence": 0xFFFFFFFF}])
+    return {"txid": txid, "version": 1, "locktime": 0, "size": 100,
+            "vin": vin,
+            "vout": [{"value": Decimal("3"), "n": 0,
+                      "scriptPubKey": {
+                          "type": "pubkeyhash", "addresses": ["addr1"],
+                          "reqSigs": 1, "asm": "OP_DUP", "hex": "76a914"}}]}
+
+
 class BlockDaemon(FakeDaemon):
     """A FakeDaemon whose blocks name their transactions, so sync_blocks has
-    something to fetch detail for (FakeDaemon's blocks are empty)."""
+    something to fetch detail for (FakeDaemon's blocks are empty).
 
-    def __init__(self, tip, txids_at, **kw):
+    `decoded=True` behaves like a daemon that honours getblock's verbosity
+    argument: the block reply carries the transaction objects, so the indexer's
+    fast path can be exercised. Without it the replies carry bare txids, which
+    is the shape a daemon without the argument gives.
+    """
+
+    def __init__(self, tip, txids_at, decoded=False, **kw):
         super().__init__(tip, **kw)
         self.txids_at = txids_at
+        self.decoded = decoded
 
-    def getblock(self, blockhash):
+    def getblock(self, blockhash, verbosity=1):
         height = int(blockhash[1:])
-        return block_at(self, height, self.txids_at.get(height, ()))
+        txids = self.txids_at.get(height, ())
+        if self.decoded and verbosity >= 2:
+            return block_at(self, height,
+                            [self.verbose_tx(t, height, i)
+                             for i, t in enumerate(txids)])
+        return block_at(self, height, txids)
+
+    def verbose_tx(self, txid, height, index):
+        """The decoded-tx shape getrawtransaction would have returned."""
+        return {"txid": txid, "version": 1, "locktime": 0, "size": 100,
+                "vin": [{"txid": "prev", "vout": 0, "sequence": 0xFFFFFFFF}],
+                "vout": [{"value": Decimal("1.5"), "n": 0,
+                          "scriptPubKey": {
+                              "type": "pubkeyhash", "addresses": ["addr1"],
+                              "reqSigs": 1, "asm": "OP_DUP", "hex": "76a914"}}]}
 
 
 def script_hex(tag):
@@ -2016,6 +2050,27 @@ class TotalCoinbaseCacheTest(DBTestCase):
                           [("miner", pokes, 1)], coinbase=True))
         return tag
 
+    def test_an_ordinary_tx_does_not_count_towards_minted_supply(self):
+        """Only coinbases are minted.
+
+        The counter is fed from the write path rather than the query, so it has
+        to be gated on is_coinbase itself. A confirmed non-coinbase pays a real
+        value to real addresses and must leave the figure alone; dropping the
+        guard overstates supply by every payment ever indexed.
+        """
+        from indexer import Block
+        self.db.add_block(Block({"height": 1, "hash": "B1",
+                                 "time": 1700000001, "tx": ["T1"]}))
+        self.db.add_tx(tx("T1", 1, [("p", 40 * POKE, 0)], [("C1", 0)]))
+        self.assertEqual(self.db.total_coinbase(), 0,
+                         "a non-coinbase payment was counted as minting")
+        self.assertMatchesDerived("with only a non-coinbase present")
+
+        # And the two together, since the coinbase is the part that must count.
+        self.db.add_tx(tx("C1", 1, [("miner", 50 * POKE, 0)], coinbase=True))
+        self.assertEqual(self.db.total_coinbase(), 50 * POKE)
+        self.assertMatchesDerived("with a coinbase and a payment")
+
     def derived(self):
         """The total as the defining query computes it, ignoring the counter."""
         return self.db.conn.execute(
@@ -2596,6 +2651,413 @@ class RecentBlocksTest(DBTestCase):
                 ["height", "hash", "version", "merkleroot", "time", "nonce",
                  "bits", "difficulty", "size", "prev_hash", "next_hash",
                  "n_txs"]))
+
+
+class BlockVerbosityTest(DBTestCase):
+    """getblock verbosity=2 hands back the window's transactions decoded.
+
+    The chain sync used to ask per transaction, which on a real window of 100
+    blocks is ~880 extra round trips and most of the time the window cost.
+    Reading them off the block reply removes both, and as a side effect removes
+    the case that needed a placeholder: a confirmed tx whose outputs are all
+    spent cannot be fetched by txid at all (this fork has no -txindex), which is
+    why the genesis coinbase used to be stored without inputs or outputs.
+    """
+
+    def vers(self, txid, coinbase=False):
+        vin = ([{"coinbase": "00deadbeef", "sequence": 0xFFFFFFFF}] if coinbase
+               else [{"txid": "prev", "vout": 0, "sequence": 0xFFFFFFFF}])
+        return {"txid": txid, "version": 1, "locktime": 0, "size": 100,
+                "vin": vin,
+                "vout": [{"value": Decimal("3"), "n": 0,
+                          "scriptPubKey": {
+                              "type": "pubkeyhash", "addresses": ["addr1"],
+                              "reqSigs": 1, "asm": "OP_DUP", "hex": "76a914"}}]}
+
+    def vers(self, txid, coinbase=False):
+        return daemon_tx(txid, coinbase)
+
+    def resolvable(self, d):
+        """Make `d` hand out detail by txid, recording what it was asked for.
+
+        BlockDaemon's blocks carry txids and its getrawtransaction only knows
+        the mempool, so the fallback path needs this to have anything to find.
+        """
+        def getrawtransaction(txid, verbose=True):
+            d.fetched.append(txid)
+            return self.vers(txid)
+
+        d.getrawtransaction = getrawtransaction
+        return d
+
+    class Decoded(BlockDaemon):
+        """A daemon that honours getblock verbosity=2 like the real one."""
+
+        def getblock(self, blockhash, verbosity=1):
+            blk = BlockDaemon.getblock(self, blockhash, verbosity)
+            if verbosity < 2:
+                return blk
+            blk["tx"] = [daemon_tx(t, t.startswith("CB"))
+                         for t in self.txids_at.get(blk["height"], ())]
+            return blk
+
+    class Recording(BlockDaemon):
+        """A BlockDaemon that notes every verbosity it was asked for.
+
+        One entry per getblock call, so a window of 100 blocks asking for
+        verbosity 2 records 100.
+        """
+
+        def __init__(self, *a, **kw):
+            super().__init__(*a, **kw)
+            self.asked = []
+
+        def getblock(self, blockhash, verbosity=1):
+            self.asked.append(verbosity)
+            return BlockDaemon.getblock(self, blockhash, verbosity)
+
+    class RecordingDecoded(Recording, Decoded):
+        """A daemon that honours the argument and notes what it was asked for."""
+
+        def getblock(self, blockhash, verbosity=1):
+            self.asked.append(verbosity)
+            return BlockVerbosityTest.Decoded.getblock(self, blockhash,
+                                                      verbosity)
+
+    def multi_window_daemon(self, decoded):
+        """400 blocks of one tx each, four windows of 100, for watching whether
+        a fallback is remembered across windows rather than re-paid per one."""
+        cls = self.RecordingDecoded if decoded else self.Recording
+        d = cls(400, {i: ["T%03d" % i] for i in range(1, 401)})
+        self.indexer.rpc = d
+        return d
+
+    def test_transactions_are_taken_from_the_block_reply(self):
+        d = BlockVerbosityTest.Decoded(1, {1: ["CB", "A"]})
+        d.getrawtransaction = lambda txid, verbose=True: self.fail(
+            "a verbosity=2 window must need no per-tx lookup")
+        self.indexer.rpc = d
+        self.indexer.sync_blocks()
+        self.assertEqual(self.db.query(
+            "SELECT txid FROM txs WHERE status='confirmed' ORDER BY txid"),
+            [("A",), ("CB",)])
+
+    def test_every_field_is_stored_not_just_the_txid(self):
+        d = BlockVerbosityTest.Decoded(1, {1: ["A"]})
+        self.indexer.rpc = d
+        self.indexer.sync_blocks()
+        # size, version, locktime and the outputs all have to survive, or the
+        # chain index silently loses data the old per-tx path recorded.
+        self.assertEqual(self.db.query(
+            "SELECT size, version FROM txs WHERE txid='A'"), [(100, 1)])
+        self.assertEqual(self.db.query(
+            "SELECT COUNT(*) FROM addr_out WHERE txid='A'")[0][0], 1)
+
+    def test_a_spent_coinbase_is_stored_in_full_rather_than_stubbed(self):
+        # The genesis coinbase is the guaranteed instance: nothing ever spends
+        # it back, so a lookup by txid can never resolve it and it used to be
+        # stored with no inputs or outputs at all.
+        self.indexer.rpc = BlockVerbosityTest.Decoded(0, {0: ["CB"]})
+        self.indexer.sync_blocks()
+        self.assertEqual(self.indexer.counters["tx_stub"], 0)
+        self.assertEqual(self.db.query(
+            "SELECT txid, is_coinbase FROM txs WHERE height=0"), [("CB", True)])
+        self.assertEqual(self.db.query(
+            "SELECT COUNT(*) FROM addr_out WHERE txid='CB'")[0][0], 1)
+
+    def test_a_daemon_returning_txids_still_works(self):
+        d = BlockDaemon(1, {1: ["CB", "A"]})
+        self.resolvable(d)
+        self.indexer.rpc = d
+        self.indexer.sync_blocks()
+        self.assertEqual(self.db.tip_height(), 1)
+        self.assertEqual(sorted(d.fetched), ["A", "CB"])
+        self.assertEqual(self.indexer._verbosity, 1,
+                         "txids in the reply did not latch the verbosity down")
+
+    def test_a_daemon_that_rejects_the_argument_falls_back(self):
+        class NoVerbosity(BlockDaemon):
+            def getblock(self, blockhash, verbosity=1):
+                if verbosity != 1:
+                    raise RPCError(
+                        "batch getblock[0] failed: getblock <hash>\n"
+                        "Displays details of a block with a <hash> given.")
+                return BlockDaemon.getblock(self, blockhash, verbosity)
+
+        d = NoVerbosity(1, {1: ["CB", "A"]})
+        self.resolvable(d)
+        self.indexer.rpc = d
+        self.indexer.sync_blocks()
+        self.assertEqual(self.db.tip_height(), 1)
+        self.assertEqual(self.db.query(
+            "SELECT COUNT(*) FROM txs WHERE status='confirmed'")[0][0], 2)
+        self.assertEqual(self.indexer._verbosity, 1)
+
+    def transient(self, message):
+        """A daemon that fails the window once with `message`, then behaves."""
+        class Flaky(BlockVerbosityTest.Decoded):
+            def __init__(self, *a, **kw):
+                super().__init__(*a, **kw)
+                self.failed = False
+
+            def getblock(self, blockhash, verbosity=1):
+                if not self.failed:
+                    self.failed = True
+                    raise RPCError(message)
+                return BlockVerbosityTest.Decoded.getblock(self, blockhash,
+                                                          verbosity)
+
+        d = Flaky(1, {1: ["CB", "A"]})
+        self.indexer.rpc = d
+        return d
+
+    def test_a_dropped_connection_does_not_retire_the_fast_path(self):
+        # One RPC failure is not a statement about the daemon's arguments. If it
+        # were read as one, a momentary hiccup would cost the fast path for the
+        # life of the process, with only a fallback notice to show for it.
+        d = self.transient("connection failed: [Errno 111] Connection refused")
+        with self.assertRaises(RPCError):
+            self.indexer.sync_blocks()
+        self.assertEqual(self.indexer._verbosity, 2,
+                         "a transport failure retired the verbosity")
+        # The window is retried and the fast path is intact.
+        self.indexer.sync_blocks()
+        self.assertEqual(self.indexer._verbosity, 2)
+        self.assertEqual(self.db.tip_height(), 1)
+
+    def test_an_http_failure_does_not_retire_the_fast_path(self):
+        d = self.transient("HTTP 500: Internal Server Error")
+        with self.assertRaises(RPCError):
+            self.indexer.sync_blocks()
+        self.assertEqual(self.indexer._verbosity, 2)
+        self.indexer.sync_blocks()
+        self.assertEqual(self.db.tip_height(), 1)
+
+    def test_a_malformed_reply_does_not_retire_the_fast_path(self):
+        d = self.transient("invalid JSON-RPC response: not json")
+        with self.assertRaises(RPCError):
+            self.indexer.sync_blocks()
+        self.assertEqual(self.indexer._verbosity, 2)
+
+    def test_an_unreadable_block_does_not_retire_the_fast_path(self):
+        # One bad block in the window is a problem with the block, not with the
+        # argument, and getblockhash will still be fine on the retry.
+        d = self.transient("No information available about block")
+        with self.assertRaises(RPCError):
+            self.indexer.sync_blocks()
+        self.assertEqual(self.indexer._verbosity, 2)
+
+    def test_a_usage_complaint_does_retire_the_fast_path(self):
+        # The other side of the same rule: a refusal that really is about the
+        # argument must still be recognised, or a pre-verbosity daemon would
+        # fail every window forever instead of falling back once. The retry
+        # inside the same window is what makes this a fallback rather than an
+        # error, so nothing reaches the caller.
+        d = self.transient("batch getblock[0] failed: getblock <hash> [verbose]")
+        self.indexer.sync_blocks()
+        self.assertEqual(self.indexer._verbosity, 1)
+        self.assertEqual(self.db.tip_height(), 1)
+
+    def test_a_daemon_being_unavailable_is_not_a_usage_complaint(self):
+        # "invalid parameter" is a usage phrase, but this daemon is reporting
+        # that it could not be reached, so the fast path has to survive.
+        d = self.transient("connection failed: HTTP 400 Bad Request: "
+                           "invalid parameter to server")
+        with self.assertRaises(RPCError):
+            self.indexer.sync_blocks()
+        self.assertEqual(self.indexer._verbosity, 2)
+
+    def test_a_rejecting_daemon_is_not_asked_verbosity_again(self):
+        class Rejects(BlockDaemon):
+            def __init__(self, *a, **kw):
+                super().__init__(*a, **kw)
+                self.asked = []
+
+            def getblock(self, blockhash, verbosity=1):
+                self.asked.append(verbosity)
+                if verbosity != 1:
+                    raise RPCError(
+                        "batch getblock[0] failed: getblock <hash>\n"
+                        "Displays details of a block with a <hash> given.")
+                return BlockDaemon.getblock(self, blockhash, verbosity)
+
+        d = Rejects(400, {i: ["T%03d" % i] for i in range(1, 401)})
+        self.resolvable(d)
+        self.indexer.rpc = d
+        self.indexer.sync_blocks(batch_size=100)
+        self.assertEqual(self.indexer._verbosity, 1)
+        # Asked once across four windows. The first block of the first window
+        # fails the batch, the window retries without the argument and succeeds,
+        # and no later window asks again.
+        self.assertEqual(d.asked.count(2), 1,
+                         "the argument was re-asked after the daemon refused it")
+        self.assertEqual(self.db.tip_height(), 400)
+
+    def test_a_daemon_that_ignores_the_argument_is_not_asked_again(self):
+        # The case a refusal cannot catch: the daemon accepts verbosity=2 and
+        # answers with bare txids anyway. Nothing errors, so only the shape of
+        # the reply reveals it -- and if the indexer does not act on that, every
+        # later window asks again and pays for a per-tx fallback it already
+        # knows is pointless.
+        d = self.multi_window_daemon(False)
+        self.resolvable(d)
+        self.indexer.sync_blocks(batch_size=100)
+        self.assertEqual(self.indexer._verbosity, 1,
+                         "txids in the reply did not latch the verbosity down")
+        self.assertEqual(d.asked.count(2), 100,
+                         "only the first window may ask for verbosity 2")
+        # Correct but slow: the fallback still indexed every transaction.
+        self.assertEqual(self.db.tip_height(), 400)
+        self.assertEqual(self.db.query("SELECT COUNT(*) FROM txs")[0][0], 400)
+
+    def test_a_daemon_that_honours_the_argument_keeps_asking(self):
+        d = self.multi_window_daemon(True)
+        self.indexer.sync_blocks(batch_size=100)
+        self.assertEqual(self.indexer._verbosity, 2)
+        self.assertEqual(d.asked.count(2), 401,
+                         "a daemon that honours the argument must keep it")
+        self.assertEqual(self.db.tip_height(), 400)
+
+
+class PrefetchReindexTest(DBTestCase):
+    """The batched read must not answer for a version the window replaced.
+
+    prefetch_txs() replaces the per-tx "what did this txid already hold?" reads
+    with one statement per batch, so each answer is computed once and consumed
+    once. These are the cases where that could be wrong: the same txid added
+    twice inside one window, and a txid prefetched and then re-indexed.
+    """
+
+    def assertMatchesDerived(self, msg=""):
+        """Every maintained counter must equal the query that defines it."""
+        for key, sql in db_module.STATS:
+            self.assertEqual(self.db._stat(key),
+                             self.db.conn.execute(sql).fetchone()[0],
+                             "%s: %s" % (key, msg))
+
+    def test_the_cache_survives_every_tx_of_its_window(self):
+        """The batch has to keep answering for the whole window.
+
+        Nothing between the prefetch and the last add_tx may drop it. That
+        holds the invalidation sites to the two that describe rows being
+        deleted: _refresh_spent_flags runs after every add_tx to settle spent
+        flags, and clearing the cache there would leave one prefetched answer
+        consumed and every later one discarded, which is silently no faster
+        than not prefetching at all.
+        """
+        ids = ["C%d" % i for i in range(40)]
+        txs = [tx(i, 1, [("m", POKE, 0)], coinbase=True) for i in ids]
+
+        class Counting:
+            """Wraps the connection and counts the per-tx reads it sees."""
+
+            def __init__(self, inner):
+                self.inner, self.per_tx = inner, 0
+
+            def execute(self, sql, *a, **kw):
+                flat = " ".join(sql.split())
+                if ("FROM txs WHERE txid=?" in flat
+                        or "FROM vin WHERE txid=?" in flat):
+                    self.per_tx += 1
+                return self.inner.execute(sql, *a, **kw)
+
+            def __getattr__(self, k):
+                return getattr(self.inner, k)
+
+        for prefetch in (False, True):
+            db = self.fresh_db()
+            counted = Counting(db.conn)
+            db.conn = counted
+            with db.bulk():
+                if prefetch:
+                    db.prefetch_txs(ids)
+                for t in txs:
+                    db.add_tx(t)
+            db.conn.close()
+            if prefetch:
+                self.assertEqual(counted.per_tx, 0,
+                                 "the batch read per-tx anyway")
+            else:
+                self.assertGreater(counted.per_tx, 0,
+                                   "baseline must actually read per-tx")
+
+    def test_reindex_inside_one_prefetched_window(self):
+        with self.db.bulk():
+            self.db.prefetch_txs(["C1"])
+            self.db.add_tx(tx("C1", 1, [("miner", 10 * POKE, 0)], coinbase=True))
+            # Prefetched again inside the same window: the first answer is gone,
+            # so this has to read the version the window just wrote.
+            self.db.prefetch_txs(["C1"])
+            self.db.add_tx(tx("C1", 1, [("miner", 30 * POKE, 0)], coinbase=True))
+        self.assertEqual(self.db.n_txs(), 1)
+        self.assertEqual(self.db.total_coinbase(), 30 * POKE)
+        self.assertMatchesDerived("after a prefetched re-index")
+
+    def test_prefetch_then_reindex_in_a_later_window(self):
+        with self.db.bulk():
+            self.db.add_tx(tx("C1", 1, [("miner", 10 * POKE, 0)], coinbase=True))
+        with self.db.bulk():
+            self.db.prefetch_txs(["C1"])
+            self.db.add_tx(tx("C1", 1, [("miner", 30 * POKE, 0)], coinbase=True))
+        self.assertEqual(self.db.n_txs(), 1)
+        self.assertEqual(self.db.total_coinbase(), 30 * POKE)
+        self.assertMatchesDerived("after a prefetched re-index in a later window")
+
+    def test_prefetch_sees_what_an_earlier_window_committed(self):
+        with self.db.bulk():
+            self.db.add_tx(tx("C1", 1, [("miner", 50 * POKE, 0)], coinbase=True))
+        with self.db.bulk():
+            self.db.add_tx(tx("T1", 1, [("p", 40 * POKE, 0)], [("C1", 0)]))
+        # A prefetch issued after the commit must report the committed input,
+        # which is what makes `released` empty and the input stay spent.
+        with self.db.bulk():
+            self.db.prefetch_txs(["T1"])
+            self.db.add_tx(tx("T1", 1, [("p", 40 * POKE, 0)], [("C1", 0)]))
+        self.assertEqual(self.spent_by("C1"), 1)
+        self.assertMatchesDerived("after re-adding an unchanged tx")
+
+    def test_prefetch_after_truncation_does_not_describe_deleted_rows(self):
+        # Built the way the indexer builds a window: the block and its txs go
+        # in together.
+        from indexer import Block
+        daemon = FakeDaemon(2)
+
+        def window(height):
+            with self.db.bulk():
+                self.db.add_block(Block(block_at(daemon, height, ["C1", "T1"])))
+                self.db.prefetch_txs(["T1"])
+                self.db.add_tx(tx("C1", height, [("miner", 50 * POKE, 0)],
+                                  coinbase=True))
+                self.db.add_tx(tx("T1", height, [("p", 40 * POKE, 0)],
+                                  [("C1", 0)]))
+
+        window(1)
+        self.db.clear_from(1)
+        # The prefetch above described rows the truncation deleted. Re-adding has
+        # to see no previous version, not the deleted one.
+        window(2)
+        self.assertEqual(self.spent_by("C1"), 1)
+        self.assertMatchesDerived("after re-adding a truncated tx")
+
+    def test_prefetch_then_remove_tx_does_not_describe_deleted_rows(self):
+        """Same hazard through the other row-deleting path.
+
+        An eviction hands prefetch_txs() a batch and then removes them before
+        re-adding the tx that replaced them, so a cache outliving the removal
+        would attribute the old inputs to the new version.
+        """
+        with self.db.bulk():
+            self.db.add_tx(tx("C1", 1, [("miner", 50 * POKE, 0)], coinbase=True))
+            self.db.add_tx(tx("T1", 1, [("p", 40 * POKE, 0)], [("C1", 0)]))
+        with self.db.bulk():
+            self.db.prefetch_txs(["T1"])
+            self.db.remove_tx("T1")
+            # No longer spends the old output, so re-adding must mark C1 unspent
+            # rather than leaving the spent flag the prefetched answer implied.
+            self.db.add_tx(tx("T1", 1, [("p", 10 * POKE, 0)], [("C1", 0)]))
+        self.assertEqual(self.spent_by("C1"), 1)
+        self.assertEqual(self.db.n_txs(), 2)
+        self.assertMatchesDerived("after removing and re-adding a prefetched tx")
 
 
 if __name__ == "__main__":
