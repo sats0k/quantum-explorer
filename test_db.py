@@ -2583,7 +2583,9 @@ class BlockVerbosityTest(DBTestCase):
         class NoVerbosity(BlockDaemon):
             def getblock(self, blockhash, verbosity=1):
                 if verbosity != 1:
-                    raise RPCError("getblock takes 1 argument")
+                    raise RPCError(
+                        "batch getblock[0] failed: getblock <hash>\n"
+                        "Displays details of a block with a <hash> given.")
                 return BlockDaemon.getblock(self, blockhash)
 
         d = NoVerbosity(2, {1: ["CB", "A"], 2: ["B"]})
@@ -2594,23 +2596,109 @@ class BlockVerbosityTest(DBTestCase):
             "SELECT COUNT(*) FROM txs WHERE status='confirmed'")[0][0], 3)
         self.assertEqual(self.indexer._verbosity, 1)
 
-    def test_a_rejecting_daemon_is_not_asked_verbosity_again(self):
-        d = self.multi_window_daemon(False)
+    def transient(self, message):
+        """A daemon that fails the window once with `message`, then behaves."""
+        class Flaky(BlockDaemon):
+            def __init__(self, *a, **kw):
+                super().__init__(*a, **kw)
+                self.failed = False
+
+            def getblock(self, blockhash, verbosity=1):
+                if not self.failed:
+                    self.failed = True
+                    raise RPCError(message)
+                return BlockDaemon.getblock(self, blockhash, verbosity)
+
+        d = Flaky(2, {1: ["CB", "A"], 2: ["B"]})
         d.decoded_blocks = True
-        # It rejects the argument but would have honoured it.
-        base = BlockDaemon.getblock
+        self.indexer.rpc = d
+        return d
 
-        def getblock(self, blockhash, verbosity=1):
-            self.asked.append(verbosity)
-            if verbosity != 1:
-                raise RPCError("getblock takes 1 argument")
-            return base(self, blockhash, verbosity)
+    def test_a_dropped_connection_does_not_retire_the_fast_path(self):
+        # One RPC failure is not a statement about the daemon's arguments. If it
+        # were read as one, a momentary hiccup would cost the fast path for the
+        # life of the process, with only a fallback notice to show for it.
+        d = self.transient("connection failed: [Errno 111] Connection refused")
+        with self.assertRaises(RPCError):
+            self.indexer.sync_blocks()
+        self.assertEqual(self.indexer._verbosity, 2,
+                         "a transport failure retired the verbosity")
+        # The window is retried and the fast path is intact.
+        self.indexer.sync_blocks()
+        self.assertEqual(self.indexer._verbosity, 2)
+        self.assertEqual(d.fetched, [])
+        self.assertEqual(self.db.tip_height(), 2)
 
-        d.getblock = getblock.__get__(d, type(d))
+    def test_an_http_failure_does_not_retire_the_fast_path(self):
+        d = self.transient("HTTP 500: Internal Server Error")
+        with self.assertRaises(RPCError):
+            self.indexer.sync_blocks()
+        self.assertEqual(self.indexer._verbosity, 2)
+        self.indexer.sync_blocks()
+        self.assertEqual(self.db.tip_height(), 2)
+
+    def test_a_malformed_reply_does_not_retire_the_fast_path(self):
+        d = self.transient("invalid JSON-RPC response: not json")
+        with self.assertRaises(RPCError):
+            self.indexer.sync_blocks()
+        self.assertEqual(self.indexer._verbosity, 2)
+
+    def test_an_unreadable_block_does_not_retire_the_fast_path(self):
+        # One bad block in the window is a problem with the block, not with the
+        # argument, and getblockhash will still be fine on the retry.
+        d = self.transient("No information available about block")
+        with self.assertRaises(RPCError):
+            self.indexer.sync_blocks()
+        self.assertEqual(self.indexer._verbosity, 2)
+
+    def test_a_usage_complaint_does_retire_the_fast_path(self):
+        # The other side of the same rule: a refusal that really is about the
+        # argument must still be recognised, or a pre-verbosity daemon would
+        # fail every window forever instead of falling back once. The retry
+        # inside the same window is what makes this a fallback rather than an
+        # error, so nothing reaches the caller.
+        d = self.transient("batch getblock[0] failed: getblock <hash> [verbose]")
+        self.indexer.sync_blocks()
+        self.assertEqual(self.indexer._verbosity, 1)
+        self.assertEqual(self.db.tip_height(), 2)
+        self.assertEqual(d.fetched, [],
+                         "a retry with no verbosity still returns txids")
+
+    def test_a_daemon_being_unavailable_is_not_a_usage_complaint(self):
+        # "invalid parameter" is a usage phrase, but this daemon is reporting
+        # that it could not be reached, so the fast path has to survive.
+        d = self.transient("connection failed: HTTP 400 Bad Request: "
+                           "invalid parameter to server")
+        with self.assertRaises(RPCError):
+            self.indexer.sync_blocks()
+        self.assertEqual(self.indexer._verbosity, 2)
+
+    def test_a_rejecting_daemon_is_not_asked_verbosity_again(self):
+        class Rejects(BlockDaemon):
+            def __init__(self, *a, **kw):
+                super().__init__(*a, **kw)
+                self.asked = []
+
+            def getblock(self, blockhash, verbosity=1):
+                self.asked.append(verbosity)
+                if verbosity != 1:
+                    raise RPCError(
+                        "batch getblock[0] failed: getblock <hash>\n"
+                        "Displays details of a block with a <hash> given.")
+                return BlockDaemon.getblock(self, blockhash, verbosity)
+
+        d = Rejects(400, {i: ["T%03d" % i] for i in range(1, 401)})
+        d.decoded_blocks = True
+        self.indexer.rpc = d
         self.indexer.sync_blocks(batch_size=100)
         self.assertEqual(self.indexer._verbosity, 1)
+        # Asked once across four windows. The first block of the first window
+        # fails the batch, the window retries without the argument and succeeds,
+        # and no later window asks again.
         self.assertEqual(d.asked.count(2), 1,
-                         "the argument was retried after the refusal cleared")
+                         "the argument was re-asked after the daemon refused it")
+        self.assertEqual(d.asked.count(1), 401,
+                         "every block asked without the argument")
         self.assertEqual(self.db.tip_height(), 400)
 
     def test_a_daemon_that_ignores_the_argument_is_not_asked_again(self):

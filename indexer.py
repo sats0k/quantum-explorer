@@ -184,6 +184,48 @@ def _slot_txid(t):
     return t.get("txid") if isinstance(t, dict) else t
 
 
+# A daemon that does not know the argument answers with its usage string for
+# getblock, which starts with the call signature ("getblock <hash> ...") or says
+# plainly that the parameter is wrong.
+_USAGE_MARKERS = (
+    "getblock <hash>",
+    "wrong number of parameters",
+    "unknown parameter",
+    "unrecognized parameter",
+    "invalid parameter",
+    "verbosity must be",
+)
+
+# Checked first, and decisive: these mean the request never reached a daemon
+# that had an opinion about its arguments. A proxy's own 400 page can quote the
+# phrase "invalid parameter" verbatim, so a transport failure must not be read
+# as a usage complaint however the wording looks.
+_TRANSPORT_MARKERS = (
+    "connection failed",
+    "http 4",
+    "http 5",
+    "invalid json-rpc response",
+    "timed out",
+    "timeout",
+)
+
+
+def _verbosity_unsupported(e):
+    """Is this RPCError the daemon refusing the verbosity argument?
+
+    Deliberately narrow. Treating *any* batch failure as a missing argument
+    would let one hiccup -- a dropped connection, a 500, a malformed reply,
+    an individual block that could not be read -- silently retire the fast
+    path for the rest of the process's life, with nothing in the log but a
+    fallback notice. Only a complaint about the argument itself counts; every
+    other failure is left to propagate so the retry loop can see it.
+    """
+    text = str(e).lower()
+    if any(m in text for m in _TRANSPORT_MARKERS):
+        return False
+    return any(m in text for m in _USAGE_MARKERS)
+
+
 class Indexer:
     def __init__(self, db, rpc):
         self.db = db
@@ -203,7 +245,7 @@ class Indexer:
 
         Two ways a daemon can not oblige, both permanent:
 
-        - it rejects the second argument outright (RPCError), or
+        - it rejects the second argument, saying so in a usage error, or
         - it accepts the call and answers with bare txids, having ignored the
           argument. Only the reply can tell us this, and it must be acted on:
           asking again next window would get the same bare txids, and every
@@ -213,13 +255,21 @@ class Indexer:
 
         A window holding no transactions at all proves nothing either way, so
         the verbosity is left alone rather than given up on that evidence.
+
+        A refusal of the argument is the one failure that is worth acting on.
+        Any other RPCError is re-raised untouched: a daemon that was briefly
+        unreachable has not told us anything about its arguments, and treating
+        the hiccup as a missing feature would cost the fast path permanently
+        and quietly.
         """
         if self._verbosity == 1:
             return self.rpc.batch([("getblock", (bh,)) for bh in hashes])
         try:
             blocks = self.rpc.batch(
                 [("getblock", (bh, self._verbosity)) for bh in hashes])
-        except RPCError:
+        except RPCError as e:
+            if not _verbosity_unsupported(e):
+                raise
             self._verbosity = 1
             print("daemon rejects the getblock verbosity argument, falling "
                   "back to one lookup per tx")
